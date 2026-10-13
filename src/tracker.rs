@@ -8,6 +8,17 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const MODEL_DIR: &str = "models/face_landmark";
+
+/// Models live in `Contents/Resources` when running from a macOS .app bundle
+/// (where the working directory is `/`), otherwise relative to the working
+/// directory.
+fn model_path(file: &str) -> std::path::PathBuf {
+    let bundled = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.parent()?.join("Resources").join(MODEL_DIR).join(file)))
+        .filter(|path| path.exists());
+    bundled.unwrap_or_else(|| std::path::Path::new(MODEL_DIR).join(file))
+}
 const DETECTOR_PATH: &str = "yolov4_headdetection_480x640.onnx";
 const LANDMARK_PATH: &str = "face_landmark_Nx3x160x160.onnx";
 
@@ -92,7 +103,7 @@ fn tracker_loop(rx: mpsc::Receiver<cameras::Frame>, tx: mpsc::Sender<TrackResult
     let mut landmark = match Session::builder(&environment)
         .and_then(|b| Ok(b.with_intra_threads(1)?))
         .and_then(|b| Ok(b.with_intra_op_spinning(false)?))
-        .and_then(|mut b| b.commit_from_file(format!("{MODEL_DIR}/{LANDMARK_PATH}")))
+        .and_then(|mut b| b.commit_from_file(model_path(LANDMARK_PATH)))
     {
         Ok(s) => s,
         Err(error) => {
@@ -175,7 +186,7 @@ fn spawn_detector(mut detector: Session) -> (
 /// CoreML runs the detector about 8x faster than CPU on Apple Silicon; fall back
 /// to CPU where it is unavailable.
 fn load_detector(environment: &Environment) -> Option<Session> {
-    let path = format!("{MODEL_DIR}/{DETECTOR_PATH}");
+    let path = model_path(DETECTOR_PATH);
     let coreml = Session::builder(environment)
         .and_then(|b| Ok(b.with_intra_op_spinning(false)?))
         .and_then(|b| {

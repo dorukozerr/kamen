@@ -73,7 +73,7 @@ fn main() -> Result<(), eframe::Error> {
         ..Default::default()
     };
     eframe::run_native(
-        "cameras egui demo",
+        "Kamen",
         options,
         Box::new(|_cc| {
             let mut app = App::new();
@@ -121,6 +121,9 @@ struct App {
     avatar_target: Option<avatar::RenderTarget>,
     avatar_error: Option<String>,
     avatar_only: bool,
+    /// Float above other windows. A fully covered window stops being drawn,
+    /// which freezes it in OBS's window capture.
+    keep_on_top: bool,
     background: Background,
     background_image: Option<egui::TextureHandle>,
     #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -166,6 +169,7 @@ impl App {
             avatar_target: None,
             avatar_error: None,
             avatar_only: false,
+            keep_on_top: false,
             background: Background::Color(egui::Color32::from_rgb(0, 255, 0)),
             background_image: None,
             #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -468,6 +472,15 @@ impl App {
         }
     }
 
+    fn apply_window_level(&self, ctx: &egui::Context) {
+        let level = if self.keep_on_top {
+            egui::WindowLevel::AlwaysOnTop
+        } else {
+            egui::WindowLevel::Normal
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+    }
+
     fn pick_avatar(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("VRM avatar", &["vrm"])
@@ -577,7 +590,7 @@ impl App {
                 }
             },
         };
-        if let Err(error) = avatar.render(&gl, target, &self.face.state) {
+        if let Err(error) = avatar.render(&gl, target, [0.0; 4], &self.face.state) {
             self.avatar_error = Some(format!("Avatar render: {error}"));
             self.avatar = None;
             return;
@@ -589,6 +602,30 @@ impl App {
             egui::Rect::from_min_max(egui::pos2(0.0, 1.0), egui::pos2(1.0, 0.0)),
             egui::Color32::WHITE,
         );
+    }
+
+    /// Draw the avatar-only view straight into the window and present it.
+    /// eframe paints nothing while the window is hidden, which would freeze
+    /// the picture OBS captures from it.
+    fn present_while_hidden(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let (Some(avatar), Some(target), Some(gl)) =
+            (self.avatar.as_mut(), self.avatar_target.as_ref(), frame.gl().cloned())
+        else {
+            return;
+        };
+        // The background image is an egui texture, which only egui can draw;
+        // it shows as black here.
+        let clear = match self.background {
+            Background::Color(color) => color.to_normalized_gamma_f32(),
+            Background::Image => [0.0, 0.0, 0.0, 1.0],
+            Background::Transparent => [0.0; 4],
+        };
+        if avatar.render(&gl, target, clear, &self.face.state).is_err() {
+            return;
+        }
+        let window = ctx.content_rect().size() * ctx.pixels_per_point();
+        target.blit_to_window(&gl, [window.x.round() as u32, window.y.round() as u32]);
+        present_gl_frame();
     }
 
     fn avatar_panel(&mut self, ui: &mut egui::Ui) {
@@ -615,6 +652,16 @@ impl App {
             self.face.calibrate();
         }
         ui.checkbox(&mut self.face.mirror, "Mirror");
+        if ui
+            .checkbox(&mut self.keep_on_top, "Keep on top")
+            .on_hover_text(
+                "Keeps the avatar moving in OBS. A window that is completely covered by \
+                 other windows stops being drawn, so its capture freezes.",
+            )
+            .changed()
+        {
+            self.apply_window_level(ui.ctx());
+        }
         if ui.button("Avatar only (Esc to exit)").clicked() {
             self.avatar_only = true;
         }
@@ -816,17 +863,11 @@ impl eframe::App for App {
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-        if self.autofocus.is_some() {
-            self.tick_autofocus(&ctx);
-        }
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
-        if let Some(session) = self.discovery.as_mut() {
-            poll_discovery(session);
-        }
+    /// Runs every frame, also while the window is hidden (covered, or on
+    /// another Space), when eframe skips `ui` and painting.
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         if let Some(stream) = &mut self.stream
-            && update_texture(stream, &ctx)
+            && update_texture(stream, ctx)
         {
             self.camera_fps.tick();
         }
@@ -842,6 +883,24 @@ impl eframe::App for App {
             self.track_result = None;
         }
 
+        let hidden = ctx.input(|i| i.viewport().occluded == Some(true));
+        if hidden && self.avatar_only {
+            self.present_while_hidden(ctx, frame);
+            // `ui` isn't running to ask for the next frame.
+            ctx.request_repaint_after(HIDDEN_FRAME_INTERVAL);
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        if self.autofocus.is_some() {
+            self.tick_autofocus(&ctx);
+        }
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        if let Some(session) = self.discovery.as_mut() {
+            poll_discovery(session);
+        }
+
         if self.avatar_only {
             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                 self.avatar_only = false;
@@ -855,7 +914,7 @@ impl eframe::App for App {
 
         egui::Panel::top("bar").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("cameras egui demo");
+                ui.heading("Kamen");
                 ui.separator();
                 ui.selectable_value(&mut self.source_mode, SourceMode::Usb, "USB");
                 ui.selectable_value(&mut self.source_mode, SourceMode::Rtsp, "RTSP");
@@ -1137,6 +1196,44 @@ fn show_stream(stream: &CameraStream, ui: &mut egui::Ui) -> Option<egui::Rect> {
     let size = egui::vec2(width, width / aspect);
     Some(ui.image((texture.id(), size)).rect)
 }
+
+/// Frame pacing while the window is hidden; nothing syncs to the display then.
+const HIDDEN_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
+/// Swap the window's buffers for the current OpenGL context. eframe owns the
+/// swap but skips it for hidden windows, and doesn't expose the surface, so
+/// this asks AppKit directly.
+#[cfg(target_os = "macos")]
+fn present_gl_frame() {
+    use std::ffi::{c_char, c_void};
+    #[link(name = "objc")]
+    unsafe extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+    // SAFETY: `+[NSOpenGLContext currentContext]` takes no arguments and
+    // returns an object or nil; `-flushBuffer` takes none and returns
+    // nothing. `objc_msgSend` must be called through the exact signature of
+    // the method, hence the two casts.
+    unsafe {
+        let send_id: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        let send_void: unsafe extern "C" fn(*mut c_void, *mut c_void) =
+            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        let class = objc_getClass(c"NSOpenGLContext".as_ptr());
+        if class.is_null() {
+            return;
+        }
+        let context = send_id(class, sel_registerName(c"currentContext".as_ptr()));
+        if !context.is_null() {
+            send_void(context, sel_registerName(c"flushBuffer".as_ptr()));
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn present_gl_frame() {}
 
 #[derive(Clone, Copy)]
 enum Background {

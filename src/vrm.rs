@@ -693,6 +693,7 @@ impl VrmAvatar {
 
     /// Pose from `face` and draw into `target`. `center` is the world point at
     /// the middle of the view and `view_height` the world height it shows.
+    /// `clear` is the (premultiplied) color behind the avatar.
     pub fn draw(
         &mut self,
         gl: &glow::Context,
@@ -700,6 +701,7 @@ impl VrmAvatar {
         size: [u32; 2],
         center: Vec2,
         view_height: f32,
+        clear: [f32; 4],
         face: &FaceState,
         values: &mut Vec<(String, Vec2)>,
     ) -> Result<(), String> {
@@ -726,7 +728,7 @@ impl VrmAvatar {
             gl.depth_func(glow::LEQUAL);
             gl.depth_mask(true);
             gl.color_mask(true, true, true, true);
-            gl.clear_color(0.0, 0.0, 0.0, 0.0);
+            gl.clear_color(clear[0], clear[1], clear[2], clear[3]);
             gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT);
             gl.front_face(glow::CCW);
             gl.blend_equation(glow::FUNC_ADD);

@@ -90,11 +90,13 @@ impl Avatar {
         self.offset += anchor_px / after - anchor_px / before;
     }
 
-    /// Pose the model from `face` and draw it into `target`.
+    /// Pose the model from `face` and draw it into `target`, over `clear`
+    /// (premultiplied; transparent when the UI draws the background itself).
     pub fn render(
         &mut self,
         gl: &Arc<glow::Context>,
         target: &RenderTarget,
+        clear: [f32; 4],
         face: &FaceState,
     ) -> Result<(), String> {
         let view_height = self.units_per_view_height() / self.zoom;
@@ -107,6 +109,7 @@ impl Avatar {
             target.size,
             center,
             view_height,
+            clear,
             face,
             &mut self.values,
         );
@@ -201,6 +204,20 @@ impl RenderTarget {
                 glow::RENDERBUFFER,
                 Some(self.depth_stencil),
             );
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        }
+    }
+
+    /// Copy the frame straight into the window's framebuffer, scaled to
+    /// `window_size` pixels. Used while egui isn't painting the window.
+    pub fn blit_to_window(&self, gl: &glow::Context, window_size: [u32; 2]) {
+        let [w, h] = [self.size[0] as i32, self.size[1] as i32];
+        let [window_w, window_h] = [window_size[0] as i32, window_size[1] as i32];
+        unsafe {
+            gl.disable(glow::SCISSOR_TEST);
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(self.framebuffer));
+            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None);
+            gl.blit_framebuffer(0, 0, w, h, 0, 0, window_w, window_h, glow::COLOR_BUFFER_BIT, glow::LINEAR);
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
         }
     }
