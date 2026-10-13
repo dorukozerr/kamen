@@ -1,0 +1,18 @@
+[package]
+name = "inlusio"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cameras = { version = "0.3.2", features = ["analysis", "controls"] }
+cargo-audit = "0.22.2"
+eframe = "0.34.0"
+egui = "0.34.0"
+egui-cameras = { version = "0.3.2", features = ["discover"] }
+image = "0.25.10"
+ipnet = "2.12.2"
+ndarray = "0.17.2"
+ort = "2.0.0-rc.14"
+
+[profile.dev.package."*"]
+opt-level = 3
