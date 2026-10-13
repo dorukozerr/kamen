@@ -2150,20 +2150,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "inlusio"
-version = "0.1.0"
-dependencies = [
- "cameras",
- "eframe",
- "egui",
- "egui-cameras",
- "image",
- "ipnet",
- "ndarray",
- "ort",
-]
-
-[[package]]
 name = "interpolate_name"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2326,6 +2312,20 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "kamen"
+version = "0.1.0"
+dependencies = [
+ "cameras",
+ "eframe",
+ "egui",
+ "egui-cameras",
+ "image",
+ "ipnet",
+ "ndarray",
+ "ort",
 ]
 
 [[package]]
