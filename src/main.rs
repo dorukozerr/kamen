@@ -1,6 +1,7 @@
 mod tracker;
 
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -10,13 +11,13 @@ use cameras::analysis;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use cameras::discover::DiscoverConfig;
 use cameras::{
-    CameraSource, ControlCapabilities, ControlKind, ControlRange, Controls, Device, PixelFormat,
-    Rect, Resolution, StreamConfig,
+    Camera, CameraSource, ControlCapabilities, ControlKind, ControlRange, Controls, Device,
+    PixelFormat, Rect, Resolution, StreamConfig,
 };
 use eframe::egui;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use egui_cameras::{DiscoverySession, poll_discovery, show_discovery, start_discovery};
-use egui_cameras::{capture_frame, set_active};
+use egui_cameras::{Pump, capture_frame, set_active};
 use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
 
 type ApplyRequest = (Device, Controls);
@@ -55,7 +56,7 @@ const STREAM_CONFIG: StreamConfig = StreamConfig {
         width: 1280,
         height: 720,
     },
-    framerate: 120,
+    framerate: 60,
     pixel_format: PixelFormat::Bgra8,
 };
 
@@ -85,7 +86,7 @@ struct App {
     rtsp_username: String,
     rtsp_password: String,
 
-    stream: Option<egui_cameras::Stream>,
+    stream: Option<CameraStream>,
     active: bool,
     status: String,
     last_capture: Option<String>,
@@ -97,9 +98,11 @@ struct App {
     live_apply: bool,
     autofocus: Option<AutofocusState>,
     track_enabled: bool,
-    tracker_tx: Option<mpsc::Sender<cameras::Frame>>,
+    track_flag: Arc<AtomicBool>,
     tracker_rx: Option<mpsc::Receiver<tracker::TrackResult>>,
     track_result: Option<tracker::TrackResult>,
+    camera_fps: FpsCounter,
+    track_fps: FpsCounter,
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     discover_open: bool,
     #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -133,9 +136,11 @@ impl App {
             live_apply: false,
             autofocus: None,
             track_enabled: true,
-            tracker_tx: None,
+            track_flag: Arc::new(AtomicBool::new(true)),
             tracker_rx: None,
             track_result: None,
+            camera_fps: FpsCounter::default(),
+            track_fps: FpsCounter::default(),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             discover_open: false,
             #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -392,23 +397,20 @@ impl App {
         }
     }
 
-    fn draw_track_overlay(&self, ui: &mut egui::Ui, fit: egui::Rect) {
+    fn draw_track_overlay(&self, ui: &mut egui::Ui, image_rect: egui::Rect) {
         let Some(result) = &self.track_result else {
             return;
         };
         let Some(head) = &result.head else {
             return;
         };
-        let (fw, fh) = (result.frame_w as f32, result.frame_h as f32);
-        let scale = (fit.width() / fw).min(fit.height() / fh);
-        let disp_w = fw * scale;
-        let disp_h = fh * scale;
-        let offset = [
-            fit.left() + (fit.width() - disp_w) / 2.0,
-            fit.top() + (fit.height() - disp_h) / 2.0,
-        ];
+        let scale_x = image_rect.width() / result.frame_w as f32;
+        let scale_y = image_rect.height() / result.frame_h as f32;
         let to_screen = |x: f32, y: f32| {
-            egui::pos2(offset[0] + x * scale, offset[1] + y * scale)
+            egui::pos2(
+                image_rect.left() + x * scale_x,
+                image_rect.top() + y * scale_y,
+            )
         };
         let painter = ui.painter();
         let stroke = egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(80, 200, 120));
@@ -421,7 +423,11 @@ impl App {
             egui::StrokeKind::Outside,
         );
         for point in &head.points {
-            painter.circle_filled(to_screen(point[0], point[1]), 3.0, egui::Color32::from_rgb(255, 0, 255));
+            painter.circle_filled(
+                to_screen(point[0], point[1]),
+                3.0,
+                egui::Color32::from_rgb(255, 0, 255),
+            );
         }
     }
 
@@ -449,11 +455,10 @@ impl App {
         self.status = format!("Connecting to {}...", source_label(&source));
         match cameras::open_source(source.clone(), STREAM_CONFIG) {
             Ok(camera) => {
-                self.stream = Some(egui_cameras::spawn(camera));
+                let (tracker_tx, tracker_rx) = tracker::spawn_tracker();
+                self.stream = Some(spawn_stream(camera, tracker_tx, self.track_flag.clone()));
                 self.active = true;
-                let (tx, rx) = tracker::spawn_tracker();
-                self.tracker_tx = Some(tx);
-                self.tracker_rx = Some(rx);
+                self.tracker_rx = Some(tracker_rx);
                 self.track_result = None;
                 self.status = format!("Streaming: {}", source_label(&source));
                 self.refresh_capabilities();
@@ -467,7 +472,6 @@ impl App {
 
     fn disconnect(&mut self) {
         self.stream = None;
-        self.tracker_tx = None;
         self.tracker_rx = None;
         self.track_result = None;
         self.status = "Disconnected".into();
@@ -566,21 +570,19 @@ impl eframe::App for App {
             poll_discovery(session);
         }
         if let Some(stream) = &mut self.stream
-            && let Err(error) = egui_cameras::update_texture(stream, &ctx)
+            && update_texture(stream, &ctx)
         {
-            self.status = format!("Texture upload failed: {error}");
+            self.camera_fps.tick();
         }
-        if self.track_enabled
-            && let Some(stream) = &self.stream
-            && let Some(frame) = capture_frame(&stream.pump)
-            && let Some(tx) = self.tracker_tx.as_ref()
-        {
-            let _ = tx.send(frame);
-        }
+        self.track_flag.store(self.track_enabled, Ordering::Relaxed);
         if let Some(rx) = &self.tracker_rx {
             while let Ok(result) = rx.try_recv() {
+                self.track_fps.tick();
                 self.track_result = Some(result);
             }
+        }
+        if !self.track_enabled {
+            self.track_result = None;
         }
 
         egui::Panel::top("bar").show_inside(ui, |ui| {
@@ -663,6 +665,17 @@ impl eframe::App for App {
                 }
                 ui.separator();
                 ui.label(&self.status);
+                if self.stream.is_some() {
+                    ui.separator();
+                    ui.label(format!("camera {:.0} fps", self.camera_fps.fps));
+                    if self.track_enabled {
+                        let ms = self.track_result.as_ref().map_or(0.0, |r| r.ms);
+                        ui.label(format!(
+                            "tracking {:.0} fps ({ms:.1} ms)",
+                            self.track_fps.fps
+                        ));
+                    }
+                }
                 if let Some(last) = &self.last_capture {
                     ui.separator();
                     ui.label(last);
@@ -754,9 +767,9 @@ impl eframe::App for App {
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
             if let Some(stream) = &self.stream {
-                let fit = ui.available_rect_before_wrap();
-                egui_cameras::show(stream, ui);
-                self.draw_track_overlay(ui, fit);
+                if let Some(image_rect) = show_stream(stream, ui) {
+                    self.draw_track_overlay(ui, image_rect);
+                }
             } else {
                 ui.centered_and_justified(|ui| {
                     ui.label("Pick a source, configure it, and press Connect.");
@@ -765,6 +778,113 @@ impl eframe::App for App {
         });
 
         ctx.request_repaint();
+    }
+}
+
+/// Camera pump plus the egui texture it feeds. Frames are converted to a
+/// `ColorImage` on the pump thread, so the UI thread only uploads them.
+struct CameraStream {
+    pump: Pump,
+    latest: Arc<Mutex<Option<egui::ColorImage>>>,
+    texture: Option<egui::TextureHandle>,
+}
+
+fn spawn_stream(
+    camera: Camera,
+    tracker_tx: mpsc::Sender<cameras::Frame>,
+    track: Arc<AtomicBool>,
+) -> CameraStream {
+    let latest = Arc::new(Mutex::new(None));
+    let slot = latest.clone();
+    let pump = cameras::pump::spawn(camera, move |frame| {
+        if track.load(Ordering::Relaxed) {
+            let _ = tracker_tx.send(frame.clone());
+        }
+        if let Some(image) = frame_to_color_image(&frame) {
+            *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(image);
+        }
+    });
+    CameraStream {
+        pump,
+        latest,
+        texture: None,
+    }
+}
+
+fn frame_to_color_image(frame: &cameras::Frame) -> Option<egui::ColorImage> {
+    if frame.pixel_format != PixelFormat::Bgra8 {
+        return egui_cameras::frame_to_color_image(frame).ok();
+    }
+    let (width, height) = (frame.width as usize, frame.height as usize);
+    let stride = if frame.stride == 0 {
+        width * 4
+    } else {
+        frame.stride as usize
+    };
+    let data = &frame.plane_primary[..];
+    if data.len() < stride * height.saturating_sub(1) + width * 4 {
+        return None;
+    }
+    let mut pixels = Vec::with_capacity(width * height);
+    for row in 0..height {
+        let start = row * stride;
+        pixels.extend(
+            data[start..start + width * 4]
+                .chunks_exact(4)
+                .map(|px| egui::Color32::from_rgb(px[2], px[1], px[0])),
+        );
+    }
+    Some(egui::ColorImage::new([width, height], pixels))
+}
+
+/// Upload the newest converted frame, if any. Returns whether one was uploaded.
+fn update_texture(stream: &mut CameraStream, ctx: &egui::Context) -> bool {
+    let Some(image) = stream
+        .latest
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
+    else {
+        return false;
+    };
+    match &mut stream.texture {
+        Some(texture) => texture.set(image, egui::TextureOptions::LINEAR),
+        None => {
+            stream.texture =
+                Some(ctx.load_texture("camera-frame", image, egui::TextureOptions::LINEAR));
+        }
+    }
+    true
+}
+
+/// Draw the stream aspect-fit into the available space; returns the image rect.
+fn show_stream(stream: &CameraStream, ui: &mut egui::Ui) -> Option<egui::Rect> {
+    let texture = stream.texture.as_ref()?;
+    let aspect = texture.aspect_ratio();
+    let available = ui.available_size();
+    let width = available.x.min(available.y * aspect);
+    let size = egui::vec2(width, width / aspect);
+    Some(ui.image((texture.id(), size)).rect)
+}
+
+#[derive(Default)]
+struct FpsCounter {
+    window_start: Option<Instant>,
+    count: u32,
+    fps: f32,
+}
+
+impl FpsCounter {
+    fn tick(&mut self) {
+        let now = Instant::now();
+        let start = *self.window_start.get_or_insert(now);
+        self.count += 1;
+        let elapsed = now.duration_since(start).as_secs_f32();
+        if elapsed >= 0.5 {
+            self.fps = self.count as f32 / elapsed;
+            self.count = 0;
+            self.window_start = Some(now);
+        }
     }
 }
 
