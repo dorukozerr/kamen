@@ -1,3 +1,5 @@
+mod tracker;
+
 use std::sync::mpsc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -94,6 +96,10 @@ struct App {
     apply_tx: mpsc::Sender<ApplyRequest>,
     live_apply: bool,
     autofocus: Option<AutofocusState>,
+    track_enabled: bool,
+    tracker_tx: Option<mpsc::Sender<cameras::Frame>>,
+    tracker_rx: Option<mpsc::Receiver<tracker::TrackResult>>,
+    track_result: Option<tracker::TrackResult>,
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     discover_open: bool,
     #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -126,6 +132,10 @@ impl App {
             apply_tx,
             live_apply: false,
             autofocus: None,
+            track_enabled: true,
+            tracker_tx: None,
+            tracker_rx: None,
+            track_result: None,
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             discover_open: false,
             #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -382,6 +392,39 @@ impl App {
         }
     }
 
+    fn draw_track_overlay(&self, ui: &mut egui::Ui, fit: egui::Rect) {
+        let Some(result) = &self.track_result else {
+            return;
+        };
+        let Some(head) = &result.head else {
+            return;
+        };
+        let (fw, fh) = (result.frame_w as f32, result.frame_h as f32);
+        let scale = (fit.width() / fw).min(fit.height() / fh);
+        let disp_w = fw * scale;
+        let disp_h = fh * scale;
+        let offset = [
+            fit.left() + (fit.width() - disp_w) / 2.0,
+            fit.top() + (fit.height() - disp_h) / 2.0,
+        ];
+        let to_screen = |x: f32, y: f32| {
+            egui::pos2(offset[0] + x * scale, offset[1] + y * scale)
+        };
+        let painter = ui.painter();
+        let stroke = egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(80, 200, 120));
+        let p1 = to_screen(head.rect[0], head.rect[1]);
+        let p2 = to_screen(head.rect[2], head.rect[3]);
+        painter.rect_stroke(
+            egui::Rect::from_min_max(p1, p2),
+            0.0,
+            stroke,
+            egui::StrokeKind::Outside,
+        );
+        for point in &head.points {
+            painter.circle_filled(to_screen(point[0], point[1]), 3.0, egui::Color32::from_rgb(255, 0, 255));
+        }
+    }
+
     fn build_source(&self) -> Option<CameraSource> {
         match self.source_mode {
             SourceMode::Usb => self
@@ -408,6 +451,10 @@ impl App {
             Ok(camera) => {
                 self.stream = Some(egui_cameras::spawn(camera));
                 self.active = true;
+                let (tx, rx) = tracker::spawn_tracker();
+                self.tracker_tx = Some(tx);
+                self.tracker_rx = Some(rx);
+                self.track_result = None;
                 self.status = format!("Streaming: {}", source_label(&source));
                 self.refresh_capabilities();
             }
@@ -420,6 +467,9 @@ impl App {
 
     fn disconnect(&mut self) {
         self.stream = None;
+        self.tracker_tx = None;
+        self.tracker_rx = None;
+        self.track_result = None;
         self.status = "Disconnected".into();
     }
 
@@ -520,6 +570,18 @@ impl eframe::App for App {
         {
             self.status = format!("Texture upload failed: {error}");
         }
+        if self.track_enabled
+            && let Some(stream) = &self.stream
+            && let Some(frame) = capture_frame(&stream.pump)
+            && let Some(tx) = self.tracker_tx.as_ref()
+        {
+            let _ = tx.send(frame);
+        }
+        if let Some(rx) = &self.tracker_rx {
+            while let Ok(result) = rx.try_recv() {
+                self.track_result = Some(result);
+            }
+        }
 
         egui::Panel::top("bar").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
@@ -527,6 +589,8 @@ impl eframe::App for App {
                 ui.separator();
                 ui.selectable_value(&mut self.source_mode, SourceMode::Usb, "USB");
                 ui.selectable_value(&mut self.source_mode, SourceMode::Rtsp, "RTSP");
+                ui.separator();
+                ui.checkbox(&mut self.track_enabled, "Face tracking");
                 #[cfg(any(target_os = "macos", target_os = "windows"))]
                 {
                     ui.separator();
@@ -690,7 +754,9 @@ impl eframe::App for App {
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
             if let Some(stream) = &self.stream {
+                let fit = ui.available_rect_before_wrap();
                 egui_cameras::show(stream, ui);
+                self.draw_track_overlay(ui, fit);
             } else {
                 ui.centered_and_justified(|ui| {
                     ui.label("Pick a source, configure it, and press Connect.");

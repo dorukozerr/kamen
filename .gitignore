@@ -1,2 +1,3 @@
-/target
-/docs
+models/face_landmark/yolov4_headdetection_480x640.onnx
+models/face_landmark/face_landmark_Nx3x160x160.onnx
+target
