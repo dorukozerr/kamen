@@ -1,0 +1,1346 @@
+//! VRM avatars (VRoid Studio exports, VRM 0.x and 1.0) driven by `FaceState`.
+//!
+//! A VRM file is a binary glTF with extensions for the humanoid bone map,
+//! facial expressions and toon materials. Morph targets and skinning are done
+//! on the CPU each frame; drawing is a small toon shader into an MSAA
+//! framebuffer that is resolved into the avatar render target.
+
+use std::collections::HashMap;
+use std::time::Instant;
+
+use glam::{EulerRot, Mat4, Quat, Vec2, Vec3};
+use glow::HasContext;
+use serde_json::Value;
+
+use crate::face::FaceState;
+
+const MAX_YAW: f32 = 0.70; // radians at head_yaw = 1
+const MAX_PITCH: f32 = 0.50;
+const MAX_ROLL: f32 = 0.50;
+/// How the head rotation is spread along the spine, hips to head.
+const BONE_SHARES: [(&str, f32); 4] = [("spine", 0.1), ("chest", 0.1), ("neck", 0.3), ("head", 0.5)];
+/// VRM rests in a T-pose; lower the arms by this angle.
+const ARM_DOWN: f32 = 1.25;
+/// Sideways hip travel in meters at body_x = 1.
+const BODY_TRAVEL: f32 = 0.08;
+const FOV_Y: f32 = 0.35;
+const MSAA_SAMPLES: i32 = 4;
+/// Direction toward the light, in world space (the avatar faces +Z).
+const LIGHT_DIR: Vec3 = Vec3::new(0.25, 0.45, 0.85);
+
+struct Node {
+    parent: Option<usize>,
+    rest_translation: Vec3,
+    rest_rotation: Quat,
+    scale: Vec3,
+    translation: Vec3,
+    rotation: Quat,
+    world: Mat4,
+    rest_world_rotation: Quat,
+}
+
+/// VRM 1.0 node constraint: helper bones (sleeves, twist bones) that follow
+/// another bone.
+enum ConstraintKind {
+    /// Copy the source's rotation around this local axis.
+    Roll(Vec3),
+    /// Point this local axis at the source.
+    Aim(Vec3),
+    /// Copy the source's rotation.
+    Rotation,
+}
+
+struct Constraint {
+    node: usize,
+    source: usize,
+    weight: f32,
+    kind: ConstraintKind,
+}
+
+/// One simulated bone of a spring chain (hair, clothes, ...). Its tail swings
+/// under inertia, gravity and a pull back toward the rest pose.
+struct SpringJoint {
+    node: usize,
+    /// Tail position in the node's local space.
+    tail: Vec3,
+    stiffness: f32,
+    gravity: Vec3,
+    drag: f32,
+    hit_radius: f32,
+    colliders: Vec<usize>,
+    /// World-space tail now and one step ago; `None` until first simulated.
+    state: Option<(Vec3, Vec3)>,
+}
+
+/// Sphere (or capsule, with `tail`) attached to a body bone that spring
+/// joints can't enter.
+struct Collider {
+    node: usize,
+    offset: Vec3,
+    tail: Option<Vec3>,
+    radius: f32,
+}
+
+struct Skin {
+    joints: Vec<usize>,
+    inverse_bind: Vec<Mat4>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum AlphaMode {
+    Opaque,
+    Mask,
+    Blend,
+}
+
+struct Material {
+    image: Option<usize>,
+    color: [f32; 4],
+    shade: [f32; 3],
+    /// N·L where shading is fully dark / fully lit.
+    shade_range: [f32; 2],
+    alpha: AlphaMode,
+    cutoff: f32,
+    double_sided: bool,
+    depth_write: bool,
+    queue: i32,
+}
+
+struct Primitive {
+    index_offset: usize,
+    index_count: usize,
+    material: Option<usize>,
+}
+
+/// Primitives of one mesh that share a vertex buffer.
+struct Geometry {
+    node: usize,
+    mesh: usize,
+    skin: Option<usize>,
+    positions: Vec<Vec3>,
+    normals: Vec<Vec3>,
+    uvs: Vec<[f32; 2]>,
+    joints: Vec<[u16; 4]>,
+    weights: Vec<[f32; 4]>,
+    /// Per morph target: sparse position deltas.
+    morphs: Vec<Vec<(u32, Vec3)>>,
+    morph_weights: Vec<f32>,
+    indices: Vec<u32>,
+    primitives: Vec<Primitive>,
+    morphed: Vec<Vec3>,
+    /// Skinned position + normal per vertex, as uploaded to the GPU.
+    vertices: Vec<f32>,
+}
+
+struct Expression {
+    name: String,
+    /// (geometry, morph target, weight)
+    binds: Vec<(usize, usize, f32)>,
+}
+
+struct DecodedImage {
+    size: [u32; 2],
+    rgba: Vec<u8>,
+}
+
+struct GlGeometry {
+    vao: glow::VertexArray,
+    vertex_buffer: glow::Buffer,
+}
+
+struct Msaa {
+    framebuffer: glow::Framebuffer,
+    color: glow::Renderbuffer,
+    depth: glow::Renderbuffer,
+    size: [u32; 2],
+}
+
+struct GlState {
+    program: glow::Program,
+    u_view_proj: Option<glow::UniformLocation>,
+    u_color: Option<glow::UniformLocation>,
+    u_shade: Option<glow::UniformLocation>,
+    u_shade_range: Option<glow::UniformLocation>,
+    u_light: Option<glow::UniformLocation>,
+    u_cutoff: Option<glow::UniformLocation>,
+    u_alpha_mode: Option<glow::UniformLocation>,
+    textures: HashMap<usize, glow::Texture>,
+    white: glow::Texture,
+    geometries: Vec<GlGeometry>,
+    msaa: Msaa,
+}
+
+pub struct VrmAvatar {
+    pub name: Option<String>,
+    nodes: Vec<Node>,
+    /// Node indices, parents before children.
+    order: Vec<usize>,
+    root_transform: Mat4,
+    skins: Vec<Skin>,
+    geometries: Vec<Geometry>,
+    materials: Vec<Material>,
+    images: HashMap<usize, DecodedImage>,
+    /// (geometry, primitive) in draw order.
+    draw_order: Vec<(usize, usize)>,
+    bones: HashMap<String, usize>,
+    constraints: Vec<Constraint>,
+    springs: Vec<SpringJoint>,
+    colliders: Vec<Collider>,
+    last_frame: Option<Instant>,
+    expressions: Vec<Expression>,
+    /// Feet-to-top height and head joint height in meters, in the rest pose.
+    pub height: f32,
+    pub head_y: f32,
+    gl: Option<GlState>,
+}
+
+impl VrmAvatar {
+    pub fn load(data: &[u8]) -> Result<Self, String> {
+        let json = glb_json(data)?;
+        let extensions = &json["extensions"];
+        let (vrm0, vrm1) = (&extensions["VRM"], &extensions["VRMC_vrm"]);
+        if vrm0.is_null() && vrm1.is_null() {
+            return Err("glTF file has no VRM data (not a .vrm avatar)".into());
+        }
+        let is_vrm0 = vrm1.is_null();
+
+        let gltf = gltf::Gltf::from_slice_without_validation(data).map_err(|e| format!("parse VRM: {e}"))?;
+        let blob = gltf.blob.as_deref().ok_or("VRM has no binary chunk")?;
+        let document = &gltf.document;
+        let buffer = |buffer: gltf::Buffer| (buffer.index() == 0).then_some(blob);
+
+        let mut nodes: Vec<Node> = document
+            .nodes()
+            .map(|node| {
+                let (t, r, s) = node.transform().decomposed();
+                let (translation, rotation) = (Vec3::from(t), Quat::from_array(r).normalize());
+                Node {
+                    parent: None,
+                    rest_translation: translation,
+                    rest_rotation: rotation,
+                    scale: Vec3::from(s),
+                    translation,
+                    rotation,
+                    world: Mat4::IDENTITY,
+                    rest_world_rotation: Quat::IDENTITY,
+                }
+            })
+            .collect();
+        let mut order = Vec::with_capacity(nodes.len());
+        let scene = document.default_scene().or_else(|| document.scenes().next());
+        let mut stack: Vec<gltf::Node> = scene.map(|s| s.nodes().collect()).unwrap_or_default();
+        while let Some(node) = stack.pop() {
+            order.push(node.index());
+            for child in node.children() {
+                nodes[child.index()].parent = Some(node.index());
+                stack.push(child);
+            }
+        }
+
+        let skins = document
+            .skins()
+            .map(|skin| {
+                let joints: Vec<usize> = skin.joints().map(|j| j.index()).collect();
+                let mut inverse_bind: Vec<Mat4> = skin
+                    .reader(buffer)
+                    .read_inverse_bind_matrices()
+                    .map(|m| m.map(|m| Mat4::from_cols_array_2d(&m)).collect())
+                    .unwrap_or_default();
+                inverse_bind.resize(joints.len(), Mat4::IDENTITY);
+                Skin { joints, inverse_bind }
+            })
+            .collect();
+
+        let mut geometries: Vec<Geometry> = Vec::new();
+        for node in document.nodes() {
+            let Some(mesh) = node.mesh() else {
+                continue;
+            };
+            // Primitives usually share one vertex buffer and differ in indices.
+            let mut by_accessor: HashMap<usize, usize> = HashMap::new();
+            for primitive in mesh.primitives() {
+                let Some(position_accessor) = primitive.get(&gltf::Semantic::Positions) else {
+                    continue;
+                };
+                let reader = primitive.reader(buffer);
+                let geometry_index = match by_accessor.get(&position_accessor.index()) {
+                    Some(&index) => index,
+                    None => {
+                        let Some(positions) = reader.read_positions() else {
+                            continue;
+                        };
+                        let positions: Vec<Vec3> = positions.map(Vec3::from).collect();
+                        let count = positions.len();
+                        let mut normals: Vec<Vec3> = reader
+                            .read_normals()
+                            .map(|n| n.map(Vec3::from).collect())
+                            .unwrap_or_default();
+                        normals.resize(count, Vec3::Z);
+                        let mut uvs: Vec<[f32; 2]> = reader
+                            .read_tex_coords(0)
+                            .map(|t| t.into_f32().collect())
+                            .unwrap_or_default();
+                        uvs.resize(count, [0.0; 2]);
+                        let mut joints: Vec<[u16; 4]> = reader
+                            .read_joints(0)
+                            .map(|j| j.into_u16().collect())
+                            .unwrap_or_default();
+                        joints.resize(count, [0; 4]);
+                        let mut weights: Vec<[f32; 4]> = reader
+                            .read_weights(0)
+                            .map(|w| w.into_f32().collect())
+                            .unwrap_or_default();
+                        weights.resize(count, [0.0; 4]);
+                        let morphs: Vec<Vec<(u32, Vec3)>> = reader
+                            .read_morph_targets()
+                            .map(|(deltas, _, _)| {
+                                deltas
+                                    .map(|deltas| {
+                                        deltas
+                                            .enumerate()
+                                            .filter(|(_, d)| d.iter().any(|c| c.abs() > 1e-7))
+                                            .map(|(i, d)| (i as u32, Vec3::from(d)))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default()
+                            })
+                            .collect();
+                        geometries.push(Geometry {
+                            node: node.index(),
+                            mesh: mesh.index(),
+                            skin: node.skin().map(|s| s.index()),
+                            morph_weights: vec![0.0; morphs.len()],
+                            morphed: positions.clone(),
+                            vertices: vec![0.0; count * 6],
+                            positions,
+                            normals,
+                            uvs,
+                            joints,
+                            weights,
+                            morphs,
+                            indices: Vec::new(),
+                            primitives: Vec::new(),
+                        });
+                        by_accessor.insert(position_accessor.index(), geometries.len() - 1);
+                        geometries.len() - 1
+                    }
+                };
+                let geometry = &mut geometries[geometry_index];
+                let index_offset = geometry.indices.len();
+                match reader.read_indices() {
+                    Some(indices) => geometry.indices.extend(indices.into_u32()),
+                    None => geometry.indices.extend(0..geometry.positions.len() as u32),
+                }
+                let vertex_count = geometry.positions.len() as u32;
+                if geometry.indices[index_offset..].iter().any(|&i| i >= vertex_count) {
+                    return Err("VRM mesh has out-of-range vertex indices".into());
+                }
+                geometry.primitives.push(Primitive {
+                    index_offset,
+                    index_count: geometry.indices.len() - index_offset,
+                    material: primitive.material().index(),
+                });
+            }
+        }
+        if geometries.is_empty() {
+            return Err("VRM has no meshes".into());
+        }
+
+        let materials: Vec<Material> = document
+            .materials()
+            .filter_map(|material| Some((material.index()?, material)))
+            .map(|(index, material)| read_material(&material, index, &json, is_vrm0))
+            .collect();
+        let images = decode_images(document, blob, &materials);
+
+        let mut draw_order: Vec<(usize, usize)> = geometries
+            .iter()
+            .enumerate()
+            .flat_map(|(g, geometry)| (0..geometry.primitives.len()).map(move |p| (g, p)))
+            .collect();
+        draw_order.sort_by_key(|&(g, p)| {
+            geometries[g].primitives[p]
+                .material
+                .and_then(|m| materials.get(m))
+                .map_or(2000, |m| m.queue)
+        });
+
+        let mut bones = HashMap::new();
+        if is_vrm0 {
+            for bone in vrm0["humanoid"]["humanBones"].as_array().into_iter().flatten() {
+                if let (Some(name), Some(node)) = (bone["bone"].as_str(), bone["node"].as_u64()) {
+                    bones.insert(name.to_owned(), node as usize);
+                }
+            }
+        } else if let Some(map) = vrm1["humanoid"]["humanBones"].as_object() {
+            for (name, bone) in map {
+                if let Some(node) = bone["node"].as_u64() {
+                    bones.insert(name.clone(), node as usize);
+                }
+            }
+        }
+        bones.retain(|_, node| *node < nodes.len());
+
+        let expressions = read_expressions(vrm0, vrm1, is_vrm0, &geometries);
+        let nodes_len = nodes.len();
+        let (mut springs, colliders) = if is_vrm0 {
+            read_springs_vrm0(&vrm0["secondaryAnimation"], document, &nodes)
+        } else {
+            read_springs_vrm1(&extensions["VRMC_springBone"], &nodes)
+        };
+        // Simulate parents before children.
+        let mut rank = vec![usize::MAX; nodes_len];
+        for (position, &node) in order.iter().enumerate() {
+            rank[node] = position;
+        }
+        springs.sort_by_key(|joint| rank[joint.node]);
+        let name = if is_vrm0 {
+            vrm0["meta"]["title"].as_str()
+        } else {
+            vrm1["meta"]["name"].as_str()
+        }
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned);
+
+        let mut avatar = Self {
+            name,
+            nodes,
+            order,
+            // VRM 0.x models face -Z, VRM 1.0 models face +Z.
+            root_transform: if is_vrm0 {
+                Mat4::from_rotation_y(std::f32::consts::PI)
+            } else {
+                Mat4::IDENTITY
+            },
+            skins,
+            geometries,
+            materials,
+            images,
+            draw_order,
+            bones,
+            constraints: read_constraints(&json, nodes_len),
+            springs,
+            colliders,
+            last_frame: None,
+            expressions,
+            height: 1.5,
+            head_y: 1.3,
+            gl: None,
+        };
+        avatar.update_world();
+        for node in &mut avatar.nodes {
+            node.rest_world_rotation = node.world.to_scale_rotation_translation().1;
+        }
+        avatar.skin();
+        let (mut low, mut high) = (f32::MAX, f32::MIN);
+        for geometry in &avatar.geometries {
+            for vertex in geometry.vertices.chunks_exact(6) {
+                low = low.min(vertex[1]);
+                high = high.max(vertex[1]);
+            }
+        }
+        if high > low {
+            avatar.height = high - low.min(0.0);
+        }
+        avatar.head_y = match avatar.bones.get("head") {
+            Some(&head) => avatar.nodes[head].world.w_axis.y,
+            None => avatar.height * 0.85,
+        };
+        Ok(avatar)
+    }
+
+    /// Names shown in the parameter list: driven bones and all expressions.
+    pub fn param_names(&self) -> Vec<String> {
+        let bones = BONE_SHARES
+            .iter()
+            .filter(|(bone, _)| self.bones.contains_key(*bone))
+            .map(|(bone, _)| format!("Bone: {bone}"));
+        let expressions = self.expressions.iter().map(|e| format!("Expression: {}", e.name));
+        bones.chain(expressions).collect()
+    }
+
+    fn update_world(&mut self) {
+        for &index in &self.order {
+            let node = &self.nodes[index];
+            let local = Mat4::from_scale_rotation_translation(node.scale, node.rotation, node.translation);
+            let parent = node.parent.map_or(self.root_transform, |parent| self.nodes[parent].world);
+            self.nodes[index].world = parent * local;
+        }
+    }
+
+    /// Solve node constraints for the current pose. Two passes, since a
+    /// constrained node can hang off another constrained node.
+    fn apply_constraints(&mut self) {
+        if self.constraints.is_empty() {
+            return;
+        }
+        for _ in 0..2 {
+            for constraint in &self.constraints {
+                let (node, source) = (&self.nodes[constraint.node], &self.nodes[constraint.source]);
+                let rest = node.rest_rotation;
+                let target = match constraint.kind {
+                    ConstraintKind::Rotation => rest * (source.rest_rotation.inverse() * source.rotation),
+                    ConstraintKind::Roll(axis) => {
+                        let delta_in_parent = source.rotation * source.rest_rotation.inverse();
+                        let delta = rest.inverse() * delta_in_parent * rest;
+                        let swing = Quat::from_rotation_arc(axis, (delta * axis).normalize());
+                        rest * swing.inverse() * delta
+                    }
+                    ConstraintKind::Aim(axis) => {
+                        let parent = match node.parent {
+                            Some(parent) => self.nodes[parent].world,
+                            None => self.root_transform,
+                        };
+                        let parent_rotation = parent.to_scale_rotation_translation().1;
+                        let position = parent.transform_point3(node.translation);
+                        let to = (source.world.w_axis.truncate() - position).normalize_or_zero();
+                        if to == Vec3::ZERO {
+                            continue;
+                        }
+                        let from = (parent_rotation * rest * axis).normalize();
+                        parent_rotation.inverse() * Quat::from_rotation_arc(from, to) * parent_rotation * rest
+                    }
+                };
+                self.nodes[constraint.node].rotation = rest.slerp(target, constraint.weight).normalize();
+            }
+            self.update_world();
+        }
+    }
+
+    /// Step the spring bones (hair and cloth physics) by `dt` seconds.
+    fn simulate_springs(&mut self, dt: f32) {
+        if self.springs.is_empty() {
+            return;
+        }
+        let colliders: Vec<(Vec3, Option<Vec3>, f32)> = self
+            .colliders
+            .iter()
+            .map(|collider| {
+                let world = self.nodes[collider.node].world;
+                (
+                    world.transform_point3(collider.offset),
+                    collider.tail.map(|tail| world.transform_point3(tail)),
+                    collider.radius,
+                )
+            })
+            .collect();
+        for joint in &mut self.springs {
+            let node = &self.nodes[joint.node];
+            let parent_world = node.parent.map_or(self.root_transform, |parent| self.nodes[parent].world);
+            let rest_world = parent_world
+                * Mat4::from_scale_rotation_translation(node.scale, node.rest_rotation, node.rest_translation);
+            let head = rest_world.w_axis.truncate();
+            let rest_tail = rest_world.transform_point3(joint.tail);
+            let length = head.distance(rest_tail);
+            if length < 1e-5 {
+                continue;
+            }
+            let (current, previous) = joint.state.unwrap_or((rest_tail, rest_tail));
+            let mut next = current
+                + (current - previous) * (1.0 - joint.drag)
+                + (rest_tail - head) / length * joint.stiffness * dt
+                + joint.gravity * dt;
+            let keep_length = |tail: Vec3| head + (tail - head).normalize_or(rest_tail - head).normalize() * length;
+            next = keep_length(next);
+            for &index in &joint.colliders {
+                let Some(&(start, end, radius)) = colliders.get(index) else {
+                    continue;
+                };
+                // Closest point on the collider's axis (a point for spheres).
+                let closest = match end {
+                    Some(end) => {
+                        let axis = end - start;
+                        let t = ((next - start).dot(axis) / axis.length_squared().max(1e-9)).clamp(0.0, 1.0);
+                        start + axis * t
+                    }
+                    None => start,
+                };
+                let reach = radius + joint.hit_radius;
+                let away = next - closest;
+                if away.length_squared() < reach * reach {
+                    next = keep_length(closest + away.normalize_or(Vec3::Y) * reach);
+                }
+            }
+            joint.state = Some((next, current));
+
+            let to = rest_world.inverse().transform_point3(next).normalize_or_zero();
+            let from = joint.tail.normalize_or_zero();
+            if to == Vec3::ZERO || from == Vec3::ZERO {
+                continue;
+            }
+            let node = &mut self.nodes[joint.node];
+            node.rotation = (node.rest_rotation * Quat::from_rotation_arc(from, to)).normalize();
+            node.world = parent_world * Mat4::from_scale_rotation_translation(node.scale, node.rotation, node.translation);
+        }
+        self.update_world();
+    }
+
+    /// Rotate a bone by `delta` in world space, on top of its rest pose.
+    fn rotate_bone(&mut self, bone: &str, delta: Quat) {
+        if let Some(&index) = self.bones.get(bone) {
+            let node = &mut self.nodes[index];
+            let world = node.rest_world_rotation;
+            node.rotation = (node.rest_rotation * world.inverse() * delta * world).normalize();
+        }
+    }
+
+    fn pose(&mut self, face: &FaceState, values: &mut Vec<(String, Vec2)>) {
+        for node in &mut self.nodes {
+            node.translation = node.rest_translation;
+            node.rotation = node.rest_rotation;
+        }
+        // Facing the viewer: yaw toward screen right is +Y, looking down is
+        // +X, tilting the head toward screen right is -Z.
+        let (yaw, pitch, roll) = (
+            face.head_yaw * MAX_YAW,
+            face.head_pitch * MAX_PITCH,
+            -face.head_roll * MAX_ROLL,
+        );
+        for (bone, share) in BONE_SHARES {
+            if self.bones.contains_key(bone) {
+                self.rotate_bone(bone, Quat::from_euler(EulerRot::YXZ, yaw * share, pitch * share, roll * share));
+                values.push((format!("Bone: {bone}"), Vec2::new(yaw * share, pitch * share).map(f32::to_degrees)));
+            }
+        }
+        self.rotate_bone("leftUpperArm", Quat::from_rotation_z(-ARM_DOWN));
+        self.rotate_bone("rightUpperArm", Quat::from_rotation_z(ARM_DOWN));
+        if let Some(&hips) = self.bones.get("hips") {
+            let parent_rotation = match self.nodes[hips].parent {
+                Some(parent) => self.nodes[parent].rest_world_rotation,
+                None => self.root_transform.to_scale_rotation_translation().1,
+            };
+            let travel = Vec3::new(face.body_x * BODY_TRAVEL, 0.0, 0.0);
+            self.nodes[hips].translation += parent_rotation.inverse() * travel;
+        }
+        self.update_world();
+        self.apply_constraints();
+        let now = Instant::now();
+        let dt = self.last_frame.map_or(0.0, |last| now.duration_since(last).as_secs_f32().min(0.05));
+        self.last_frame = Some(now);
+        self.simulate_springs(dt);
+
+        for geometry in &mut self.geometries {
+            geometry.morph_weights.fill(0.0);
+        }
+        let wide = face.mouth_width.clamp(0.0, 1.0) * (1.0 - face.mouth_open) * 0.6;
+        let narrow = (-face.mouth_width).clamp(0.0, 1.0) * (1.0 - face.mouth_open) * 0.6;
+        for expression in &self.expressions {
+            let value = match expression.name.as_str() {
+                "blinkLeft" => face.blink_left,
+                "blinkRight" => face.blink_right,
+                "aa" => face.mouth_open,
+                "ih" => wide,
+                "ou" => narrow,
+                _ => continue,
+            }
+            .clamp(0.0, 1.0);
+            values.push((format!("Expression: {}", expression.name), Vec2::new(value, 0.0)));
+            for &(geometry, morph, weight) in &expression.binds {
+                self.geometries[geometry].morph_weights[morph] += weight * value;
+            }
+        }
+    }
+
+    /// Apply morph targets and skinning on the CPU.
+    fn skin(&mut self) {
+        let joint_matrices: Vec<Vec<Mat4>> = self
+            .skins
+            .iter()
+            .map(|skin| {
+                skin.joints
+                    .iter()
+                    .zip(&skin.inverse_bind)
+                    .map(|(&joint, inverse_bind)| self.nodes[joint].world * *inverse_bind)
+                    .collect()
+            })
+            .collect();
+        for geometry in &mut self.geometries {
+            geometry.morphed.copy_from_slice(&geometry.positions);
+            for (target, &weight) in geometry.morphs.iter().zip(&geometry.morph_weights) {
+                if weight != 0.0 {
+                    for &(vertex, delta) in target {
+                        geometry.morphed[vertex as usize] += delta * weight;
+                    }
+                }
+            }
+            let node_world = self.nodes[geometry.node].world;
+            let joints = geometry.skin.and_then(|skin| joint_matrices.get(skin));
+            for (v, out) in geometry.vertices.chunks_exact_mut(6).enumerate() {
+                let matrix = match joints {
+                    Some(joints) => {
+                        let (indices, weights) = (geometry.joints[v], geometry.weights[v]);
+                        let mut blended = Mat4::ZERO;
+                        let mut total = 0.0;
+                        for (index, weight) in indices.into_iter().zip(weights) {
+                            if weight > 0.0
+                                && let Some(joint) = joints.get(index as usize)
+                            {
+                                blended += *joint * weight;
+                                total += weight;
+                            }
+                        }
+                        if total > 1e-6 { blended * (1.0 / total) } else { node_world }
+                    }
+                    None => node_world,
+                };
+                let position = matrix.transform_point3(geometry.morphed[v]);
+                let normal = matrix.transform_vector3(geometry.normals[v]);
+                out[..3].copy_from_slice(&position.to_array());
+                out[3..].copy_from_slice(&normal.to_array());
+            }
+        }
+    }
+
+    /// Pose from `face` and draw into `target`. `center` is the world point at
+    /// the middle of the view and `view_height` the world height it shows.
+    pub fn draw(
+        &mut self,
+        gl: &glow::Context,
+        target: glow::Framebuffer,
+        size: [u32; 2],
+        center: Vec2,
+        view_height: f32,
+        face: &FaceState,
+        values: &mut Vec<(String, Vec2)>,
+    ) -> Result<(), String> {
+        self.pose(face, values);
+        self.skin();
+        if self.gl.is_none() {
+            self.gl = Some(self.create_gl(gl, size)?);
+        }
+        let state = self.gl.as_mut().expect("GL state just created");
+        let [w, h] = [size[0] as i32, size[1] as i32];
+
+        let distance = view_height / 2.0 / (FOV_Y / 2.0).tan();
+        let projection = Mat4::perspective_rh_gl(FOV_Y, w as f32 / h as f32, distance * 0.1, distance + 20.0);
+        let view = Mat4::look_at_rh(center.extend(distance), center.extend(0.0), Vec3::Y);
+        let view_proj = projection * view;
+
+        unsafe {
+            state.msaa.resize(gl, size);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(state.msaa.framebuffer));
+            gl.viewport(0, 0, w, h);
+            gl.disable(glow::SCISSOR_TEST);
+            gl.disable(glow::STENCIL_TEST);
+            gl.enable(glow::DEPTH_TEST);
+            gl.depth_func(glow::LEQUAL);
+            gl.depth_mask(true);
+            gl.color_mask(true, true, true, true);
+            gl.clear_color(0.0, 0.0, 0.0, 0.0);
+            gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT);
+            gl.front_face(glow::CCW);
+            gl.blend_equation(glow::FUNC_ADD);
+            // Keeps the framebuffer's alpha premultiplied for egui.
+            gl.blend_func_separate(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA, glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+
+            gl.use_program(Some(state.program));
+            gl.uniform_matrix_4_f32_slice(state.u_view_proj.as_ref(), false, &view_proj.to_cols_array());
+            gl.uniform_3_f32_slice(state.u_light.as_ref(), &LIGHT_DIR.normalize().to_array());
+            gl.active_texture(glow::TEXTURE0);
+
+            for (geometry, gl_geometry) in self.geometries.iter().zip(&state.geometries) {
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(gl_geometry.vertex_buffer));
+                gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, 0, as_bytes(&geometry.vertices));
+            }
+            let default_material = Material::default();
+            for &(g, p) in &self.draw_order {
+                let primitive = &self.geometries[g].primitives[p];
+                let material = primitive
+                    .material
+                    .and_then(|m| self.materials.get(m))
+                    .unwrap_or(&default_material);
+                let texture = material.image.and_then(|image| state.textures.get(&image)).unwrap_or(&state.white);
+                gl.bind_texture(glow::TEXTURE_2D, Some(*texture));
+                gl.uniform_4_f32_slice(state.u_color.as_ref(), &material.color);
+                gl.uniform_3_f32_slice(state.u_shade.as_ref(), &material.shade);
+                gl.uniform_2_f32_slice(state.u_shade_range.as_ref(), &material.shade_range);
+                gl.uniform_1_f32(state.u_cutoff.as_ref(), material.cutoff);
+                gl.uniform_1_i32(state.u_alpha_mode.as_ref(), material.alpha as i32);
+                if material.alpha == AlphaMode::Blend {
+                    gl.enable(glow::BLEND);
+                } else {
+                    gl.disable(glow::BLEND);
+                }
+                gl.depth_mask(material.depth_write);
+                if material.double_sided {
+                    gl.disable(glow::CULL_FACE);
+                } else {
+                    gl.enable(glow::CULL_FACE);
+                }
+                gl.bind_vertex_array(Some(state.geometries[g].vao));
+                gl.draw_elements(
+                    glow::TRIANGLES,
+                    primitive.index_count as i32,
+                    glow::UNSIGNED_INT,
+                    (primitive.index_offset * 4) as i32,
+                );
+            }
+
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(state.msaa.framebuffer));
+            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(target));
+            gl.blit_framebuffer(0, 0, w, h, 0, 0, w, h, glow::COLOR_BUFFER_BIT, glow::NEAREST);
+
+            // Leave GL the way egui expects it.
+            gl.bind_vertex_array(None);
+            gl.bind_buffer(glow::ARRAY_BUFFER, None);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            gl.depth_mask(true);
+            gl.disable(glow::DEPTH_TEST);
+            gl.disable(glow::CULL_FACE);
+            gl.enable(glow::BLEND);
+        }
+        Ok(())
+    }
+
+    fn create_gl(&mut self, gl: &glow::Context, size: [u32; 2]) -> Result<GlState, String> {
+        unsafe {
+            let program = compile_program(gl)?;
+            gl.use_program(Some(program));
+            gl.uniform_1_i32(gl.get_uniform_location(program, "u_texture").as_ref(), 0);
+
+            let white = upload_texture(gl, [1, 1], &[255; 4])?;
+            let mut textures = HashMap::new();
+            // Decoded pixels are only needed until they are on the GPU.
+            for (index, image) in self.images.drain() {
+                textures.insert(index, upload_texture(gl, image.size, &image.rgba)?);
+            }
+
+            let mut geometries = Vec::with_capacity(self.geometries.len());
+            for geometry in &self.geometries {
+                let vao = gl.create_vertex_array()?;
+                gl.bind_vertex_array(Some(vao));
+                let vertex_buffer = gl.create_buffer()?;
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(vertex_buffer));
+                gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, as_bytes(&geometry.vertices), glow::DYNAMIC_DRAW);
+                gl.enable_vertex_attrib_array(0);
+                gl.vertex_attrib_pointer_f32(0, 3, glow::FLOAT, false, 24, 0);
+                gl.enable_vertex_attrib_array(1);
+                gl.vertex_attrib_pointer_f32(1, 3, glow::FLOAT, false, 24, 12);
+                let uv_buffer = gl.create_buffer()?;
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(uv_buffer));
+                gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, as_bytes(geometry.uvs.as_flattened()), glow::STATIC_DRAW);
+                gl.enable_vertex_attrib_array(2);
+                gl.vertex_attrib_pointer_f32(2, 2, glow::FLOAT, false, 8, 0);
+                let index_buffer = gl.create_buffer()?;
+                gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(index_buffer));
+                gl.buffer_data_u8_slice(glow::ELEMENT_ARRAY_BUFFER, as_bytes(&geometry.indices), glow::STATIC_DRAW);
+                gl.bind_vertex_array(None);
+                geometries.push(GlGeometry { vao, vertex_buffer });
+            }
+
+            let mut msaa = Msaa {
+                framebuffer: gl.create_framebuffer()?,
+                color: gl.create_renderbuffer()?,
+                depth: gl.create_renderbuffer()?,
+                size: [0, 0],
+            };
+            msaa.resize(gl, size);
+
+            Ok(GlState {
+                program,
+                u_view_proj: gl.get_uniform_location(program, "u_view_proj"),
+                u_color: gl.get_uniform_location(program, "u_color"),
+                u_shade: gl.get_uniform_location(program, "u_shade"),
+                u_shade_range: gl.get_uniform_location(program, "u_shade_range"),
+                u_light: gl.get_uniform_location(program, "u_light"),
+                u_cutoff: gl.get_uniform_location(program, "u_cutoff"),
+                u_alpha_mode: gl.get_uniform_location(program, "u_alpha_mode"),
+                textures,
+                white,
+                geometries,
+                msaa,
+            })
+        }
+    }
+}
+
+impl Default for Material {
+    fn default() -> Self {
+        Self {
+            image: None,
+            color: [1.0; 4],
+            shade: [0.8; 3],
+            shade_range: [-0.1, 0.1],
+            alpha: AlphaMode::Opaque,
+            cutoff: 0.5,
+            double_sided: true,
+            depth_write: true,
+            queue: 2000,
+        }
+    }
+}
+
+impl Msaa {
+    unsafe fn resize(&mut self, gl: &glow::Context, size: [u32; 2]) {
+        if size == self.size {
+            return;
+        }
+        self.size = size;
+        let [w, h] = [size[0] as i32, size[1] as i32];
+        unsafe {
+            let samples = MSAA_SAMPLES.min(gl.get_parameter_i32(glow::MAX_SAMPLES)).max(1);
+            gl.bind_renderbuffer(glow::RENDERBUFFER, Some(self.color));
+            gl.renderbuffer_storage_multisample(glow::RENDERBUFFER, samples, glow::RGBA8, w, h);
+            gl.bind_renderbuffer(glow::RENDERBUFFER, Some(self.depth));
+            gl.renderbuffer_storage_multisample(glow::RENDERBUFFER, samples, glow::DEPTH_COMPONENT24, w, h);
+            gl.bind_renderbuffer(glow::RENDERBUFFER, None);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.framebuffer));
+            gl.framebuffer_renderbuffer(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::RENDERBUFFER, Some(self.color));
+            gl.framebuffer_renderbuffer(glow::FRAMEBUFFER, glow::DEPTH_ATTACHMENT, glow::RENDERBUFFER, Some(self.depth));
+        }
+    }
+}
+
+/// The JSON chunk of a binary glTF: 12-byte header, then length + "JSON" + data.
+fn glb_json(data: &[u8]) -> Result<Value, String> {
+    if data.len() < 20 || &data[..4] != b"glTF" || &data[16..20] != b"JSON" {
+        return Err("not a binary glTF / VRM file".into());
+    }
+    let length = u32::from_le_bytes([data[12], data[13], data[14], data[15]]) as usize;
+    let json = data.get(20..20 + length).ok_or("truncated VRM file")?;
+    serde_json::from_slice(json).map_err(|e| format!("VRM JSON: {e}"))
+}
+
+fn floats<const N: usize>(value: &Value) -> Option<[f32; N]> {
+    let array = value.as_array()?;
+    let mut out = [0.0; N];
+    for (o, v) in out.iter_mut().zip(array) {
+        *o = v.as_f64()? as f32;
+    }
+    (array.len() >= N).then_some(out)
+}
+
+fn linear_to_srgb(value: f32) -> f32 {
+    value.max(0.0).powf(1.0 / 2.2)
+}
+
+/// Core glTF material plus the MToon shading settings from the VRM extension.
+/// Colors are kept in sRGB; the shader works in display space.
+fn read_material(material: &gltf::Material, index: usize, json: &Value, is_vrm0: bool) -> Material {
+    let pbr = material.pbr_metallic_roughness();
+    let factor = pbr.base_color_factor();
+    let alpha = match material.alpha_mode() {
+        gltf::material::AlphaMode::Opaque => AlphaMode::Opaque,
+        gltf::material::AlphaMode::Mask => AlphaMode::Mask,
+        gltf::material::AlphaMode::Blend => AlphaMode::Blend,
+    };
+    let mut out = Material {
+        image: pbr.base_color_texture().map(|info| info.texture().source().index()),
+        color: [linear_to_srgb(factor[0]), linear_to_srgb(factor[1]), linear_to_srgb(factor[2]), factor[3]],
+        alpha,
+        cutoff: material.alpha_cutoff().unwrap_or(0.5),
+        double_sided: material.double_sided(),
+        depth_write: alpha != AlphaMode::Blend,
+        queue: match alpha {
+            AlphaMode::Opaque => 2000,
+            AlphaMode::Mask => 2450,
+            AlphaMode::Blend => 3000,
+        },
+        ..Material::default()
+    };
+    if is_vrm0 {
+        let properties = &json["extensions"]["VRM"]["materialProperties"][index];
+        let (float, vector) = (&properties["floatProperties"], &properties["vectorProperties"]);
+        if let Some(color) = floats::<4>(&vector["_Color"]) {
+            out.color = color;
+        }
+        if let Some(shade) = floats::<3>(&vector["_ShadeColor"]) {
+            out.shade = shade;
+        }
+        if let (Some(shift), Some(toony)) = (float["_ShadeShift"].as_f64(), float["_ShadeToony"].as_f64()) {
+            let (shift, toony) = (shift as f32, toony as f32);
+            out.shade_range = [shift, 1.0 + (shift - 1.0) * toony];
+        }
+        if let Some(queue) = properties["renderQueue"].as_i64() {
+            out.queue = queue as i32;
+        }
+        if alpha == AlphaMode::Blend {
+            out.depth_write = float["_ZWrite"].as_f64().is_some_and(|z| z > 0.5);
+        }
+    } else {
+        let mtoon = &json["materials"][index]["extensions"]["VRMC_materials_mtoon"];
+        if let Some(shade) = floats::<3>(&mtoon["shadeColorFactor"]) {
+            out.shade = shade.map(linear_to_srgb);
+        }
+        if !mtoon.is_null() {
+            let shift = mtoon["shadingShiftFactor"].as_f64().unwrap_or(0.0) as f32;
+            let toony = mtoon["shadingToonyFactor"].as_f64().unwrap_or(0.9) as f32;
+            out.shade_range = [toony - 1.0 - shift, 1.0 - toony - shift];
+        }
+        out.queue += mtoon["renderQueueOffsetNumber"].as_i64().unwrap_or(0) as i32;
+        if alpha == AlphaMode::Blend {
+            out.depth_write = mtoon["transparentWithZWrite"].as_bool().unwrap_or(false);
+        }
+    }
+    out
+}
+
+fn vec3(value: &Value) -> Option<Vec3> {
+    match value {
+        Value::Array(_) => floats::<3>(value).map(Vec3::from),
+        Value::Object(_) => Some(Vec3::new(
+            value["x"].as_f64()? as f32,
+            value["y"].as_f64()? as f32,
+            value["z"].as_f64()? as f32,
+        )),
+        _ => None,
+    }
+}
+
+/// VRM 1.0 `VRMC_springBone`: each spring lists its joints root to tip, and
+/// each joint's tail is the next joint.
+fn read_springs_vrm1(spring_bone: &Value, nodes: &[Node]) -> (Vec<SpringJoint>, Vec<Collider>) {
+    let mut colliders = Vec::new();
+    // Indices into `colliders` per collider index in the file.
+    let mut collider_map = Vec::new();
+    for collider in spring_bone["colliders"].as_array().into_iter().flatten() {
+        let (sphere, capsule) = (&collider["shape"]["sphere"], &collider["shape"]["capsule"]);
+        let shape = if sphere.is_null() { capsule } else { sphere };
+        let parsed = collider["node"].as_u64().filter(|&n| (n as usize) < nodes.len()).map(|node| Collider {
+            node: node as usize,
+            offset: vec3(&shape["offset"]).unwrap_or(Vec3::ZERO),
+            tail: vec3(&shape["tail"]),
+            radius: shape["radius"].as_f64().unwrap_or(0.0) as f32,
+        });
+        collider_map.push(parsed.map(|collider| {
+            colliders.push(collider);
+            colliders.len() - 1
+        }));
+    }
+    let groups: Vec<Vec<usize>> = spring_bone["colliderGroups"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|group| {
+            group["colliders"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|index| collider_map.get(index.as_u64()? as usize).copied().flatten())
+                .collect()
+        })
+        .collect();
+
+    let mut joints = Vec::new();
+    for spring in spring_bone["springs"].as_array().into_iter().flatten() {
+        let spring_colliders: Vec<usize> = spring["colliderGroups"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|group| groups.get(group.as_u64()? as usize))
+            .flatten()
+            .copied()
+            .collect();
+        let chain: Vec<&Value> = spring["joints"].as_array().into_iter().flatten().collect();
+        for pair in chain.windows(2) {
+            let (Some(node), Some(next)) = (pair[0]["node"].as_u64(), pair[1]["node"].as_u64()) else {
+                continue;
+            };
+            let (node, next) = (node as usize, next as usize);
+            if node >= nodes.len() || next >= nodes.len() || nodes[next].parent != Some(node) {
+                continue;
+            }
+            let joint = pair[0];
+            let gravity_dir = vec3(&joint["gravityDir"]).unwrap_or(Vec3::NEG_Y);
+            joints.push(SpringJoint {
+                node,
+                tail: nodes[next].rest_translation,
+                stiffness: joint["stiffness"].as_f64().unwrap_or(1.0) as f32,
+                gravity: gravity_dir * joint["gravityPower"].as_f64().unwrap_or(0.0) as f32,
+                drag: joint["dragForce"].as_f64().unwrap_or(0.5) as f32,
+                hit_radius: joint["hitRadius"].as_f64().unwrap_or(0.0) as f32,
+                colliders: spring_colliders.clone(),
+                state: None,
+            });
+        }
+    }
+    (joints, colliders)
+}
+
+/// VRM 0.x `secondaryAnimation`: each group names root bones, and every bone
+/// below them is simulated with the group's settings. Vectors are in Unity's
+/// left-handed space, so z is flipped.
+fn read_springs_vrm0(secondary: &Value, document: &gltf::Document, nodes: &[Node]) -> (Vec<SpringJoint>, Vec<Collider>) {
+    let flip_z = |v: Vec3| Vec3::new(v.x, v.y, -v.z);
+    let mut colliders = Vec::new();
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for group in secondary["colliderGroups"].as_array().into_iter().flatten() {
+        let mut indices = Vec::new();
+        if let Some(node) = group["node"].as_u64().filter(|&n| (n as usize) < nodes.len()) {
+            for collider in group["colliders"].as_array().into_iter().flatten() {
+                colliders.push(Collider {
+                    node: node as usize,
+                    offset: flip_z(vec3(&collider["offset"]).unwrap_or(Vec3::ZERO)),
+                    tail: None,
+                    radius: collider["radius"].as_f64().unwrap_or(0.0) as f32,
+                });
+                indices.push(colliders.len() - 1);
+            }
+        }
+        groups.push(indices);
+    }
+
+    let children: Vec<Vec<usize>> = document.nodes().map(|n| n.children().map(|c| c.index()).collect()).collect();
+    let mut joints = Vec::new();
+    for group in secondary["boneGroups"].as_array().into_iter().flatten() {
+        // "stiffiness" is the spec's own spelling.
+        let stiffness = group["stiffiness"].as_f64().unwrap_or(1.0) as f32;
+        let gravity = flip_z(vec3(&group["gravityDir"]).unwrap_or(Vec3::NEG_Y))
+            * group["gravityPower"].as_f64().unwrap_or(0.0) as f32;
+        let drag = group["dragForce"].as_f64().unwrap_or(0.5) as f32;
+        let hit_radius = group["hitRadius"].as_f64().unwrap_or(0.0) as f32;
+        let group_colliders: Vec<usize> = group["colliderGroups"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|index| groups.get(index.as_u64()? as usize))
+            .flatten()
+            .copied()
+            .collect();
+        let mut stack: Vec<usize> = group["bones"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|bone| bone.as_u64().map(|b| b as usize))
+            .filter(|&bone| bone < nodes.len())
+            .collect();
+        while let Some(node) = stack.pop() {
+            // The tail is the first child, or for a leaf a 7 cm extension of
+            // the bone (as UniVRM does).
+            let tail = match children[node].first() {
+                Some(&child) => nodes[child].rest_translation,
+                None => nodes[node].rest_translation.normalize_or_zero() * 0.07,
+            };
+            joints.push(SpringJoint {
+                node,
+                tail,
+                stiffness,
+                gravity,
+                drag,
+                hit_radius,
+                colliders: group_colliders.clone(),
+                state: None,
+            });
+            stack.extend(&children[node]);
+        }
+    }
+    (joints, colliders)
+}
+
+fn read_constraints(json: &Value, node_count: usize) -> Vec<Constraint> {
+    let axis = |name: &str| match name {
+        "X" | "PositiveX" => Some(Vec3::X),
+        "Y" | "PositiveY" => Some(Vec3::Y),
+        "Z" | "PositiveZ" => Some(Vec3::Z),
+        "NegativeX" => Some(Vec3::NEG_X),
+        "NegativeY" => Some(Vec3::NEG_Y),
+        "NegativeZ" => Some(Vec3::NEG_Z),
+        _ => None,
+    };
+    let mut constraints = Vec::new();
+    for (node, value) in json["nodes"].as_array().into_iter().flatten().enumerate() {
+        let constraint = &value["extensions"]["VRMC_node_constraint"]["constraint"];
+        let (roll, aim, rotation) = (&constraint["roll"], &constraint["aim"], &constraint["rotation"]);
+        let (spec, kind) = if !roll.is_null() {
+            (roll, roll["rollAxis"].as_str().and_then(axis).map(ConstraintKind::Roll))
+        } else if !aim.is_null() {
+            (aim, aim["aimAxis"].as_str().and_then(axis).map(ConstraintKind::Aim))
+        } else if !rotation.is_null() {
+            (rotation, Some(ConstraintKind::Rotation))
+        } else {
+            continue;
+        };
+        let (Some(kind), Some(source)) = (kind, spec["source"].as_u64()) else {
+            continue;
+        };
+        if node < node_count && (source as usize) < node_count {
+            constraints.push(Constraint {
+                node,
+                source: source as usize,
+                weight: spec["weight"].as_f64().unwrap_or(1.0) as f32,
+                kind,
+            });
+        }
+    }
+    constraints
+}
+
+/// Decode the base-color images the materials use, in parallel.
+fn decode_images(document: &gltf::Document, blob: &[u8], materials: &[Material]) -> HashMap<usize, DecodedImage> {
+    let mut wanted: Vec<usize> = materials.iter().filter_map(|m| m.image).collect();
+    wanted.sort_unstable();
+    wanted.dedup();
+    let sources: Vec<(usize, &[u8])> = wanted
+        .into_iter()
+        .filter_map(|index| {
+            let gltf::image::Source::View { view, .. } = document.images().nth(index)?.source() else {
+                return None;
+            };
+            Some((index, blob.get(view.offset()..view.offset() + view.length())?))
+        })
+        .collect();
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = sources
+            .into_iter()
+            .map(|(index, bytes)| {
+                scope.spawn(move || {
+                    let image = image::load_from_memory(bytes).ok()?.to_rgba8();
+                    Some((index, DecodedImage { size: [image.width(), image.height()], rgba: image.into_raw() }))
+                })
+            })
+            .collect();
+        handles.into_iter().filter_map(|handle| handle.join().ok().flatten()).collect()
+    })
+}
+
+/// Expressions under VRM 1.0 preset names, with binds resolved to geometries.
+fn read_expressions(vrm0: &Value, vrm1: &Value, is_vrm0: bool, geometries: &[Geometry]) -> Vec<Expression> {
+    let resolve = |binds: Option<&Vec<Value>>, key: &str, scale: f32| -> Vec<(usize, usize, f32)> {
+        let mut out = Vec::new();
+        for bind in binds.into_iter().flatten() {
+            let (Some(owner), Some(morph)) = (bind[key].as_u64(), bind["index"].as_u64()) else {
+                continue;
+            };
+            let weight = bind["weight"].as_f64().unwrap_or(0.0) as f32 * scale;
+            for (index, geometry) in geometries.iter().enumerate() {
+                let geometry_owner = if key == "mesh" { geometry.mesh } else { geometry.node };
+                if geometry_owner == owner as usize && (morph as usize) < geometry.morphs.len() {
+                    out.push((index, morph as usize, weight));
+                }
+            }
+        }
+        out
+    };
+    let mut expressions = Vec::new();
+    if is_vrm0 {
+        for group in vrm0["blendShapeMaster"]["blendShapeGroups"].as_array().into_iter().flatten() {
+            let preset = group["presetName"].as_str().unwrap_or("unknown");
+            let name = match preset {
+                "a" => "aa",
+                "i" => "ih",
+                "u" => "ou",
+                "e" => "ee",
+                "o" => "oh",
+                "blink_l" => "blinkLeft",
+                "blink_r" => "blinkRight",
+                "joy" => "happy",
+                "sorrow" => "sad",
+                "fun" => "relaxed",
+                "unknown" => group["name"].as_str().unwrap_or("unknown"),
+                other => other,
+            };
+            expressions.push(Expression {
+                name: name.to_owned(),
+                binds: resolve(group["binds"].as_array(), "mesh", 0.01),
+            });
+        }
+    } else {
+        for section in ["preset", "custom"] {
+            for (name, expression) in vrm1["expressions"][section].as_object().into_iter().flatten() {
+                expressions.push(Expression {
+                    name: name.clone(),
+                    binds: resolve(expression["morphTargetBinds"].as_array(), "node", 1.0),
+                });
+            }
+        }
+    }
+    expressions
+}
+
+fn as_bytes<T: Copy>(slice: &[T]) -> &[u8] {
+    // SAFETY: only used with plain f32/u32 data, which has no padding and no
+    // invalid bit patterns; the byte slice covers exactly the same memory.
+    unsafe { std::slice::from_raw_parts(slice.as_ptr().cast(), std::mem::size_of_val(slice)) }
+}
+
+unsafe fn upload_texture(gl: &glow::Context, size: [u32; 2], rgba: &[u8]) -> Result<glow::Texture, String> {
+    unsafe {
+        let texture = gl.create_texture()?;
+        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+        gl.tex_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            glow::RGBA8 as i32,
+            size[0] as i32,
+            size[1] as i32,
+            0,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            glow::PixelUnpackData::Slice(Some(rgba)),
+        );
+        gl.generate_mipmap(glow::TEXTURE_2D);
+        for (parameter, value) in [
+            (glow::TEXTURE_MIN_FILTER, glow::LINEAR_MIPMAP_LINEAR),
+            (glow::TEXTURE_MAG_FILTER, glow::LINEAR),
+            (glow::TEXTURE_WRAP_S, glow::REPEAT),
+            (glow::TEXTURE_WRAP_T, glow::REPEAT),
+        ] {
+            gl.tex_parameter_i32(glow::TEXTURE_2D, parameter, value as i32);
+        }
+        Ok(texture)
+    }
+}
+
+const VERTEX_SHADER: &str = r#"#version 330 core
+layout(location = 0) in vec3 a_position;
+layout(location = 1) in vec3 a_normal;
+layout(location = 2) in vec2 a_uv;
+uniform mat4 u_view_proj;
+out vec3 v_normal;
+out vec2 v_uv;
+void main() {
+    v_normal = a_normal;
+    v_uv = a_uv;
+    gl_Position = u_view_proj * vec4(a_position, 1.0);
+}
+"#;
+
+/// Two-tone toon shading: the base color, or the base color tinted by the
+/// shade color where the surface faces away from the light.
+const FRAGMENT_SHADER: &str = r#"#version 330 core
+in vec3 v_normal;
+in vec2 v_uv;
+uniform sampler2D u_texture;
+uniform vec4 u_color;
+uniform vec3 u_shade;
+uniform vec2 u_shade_range;
+uniform vec3 u_light;
+uniform float u_cutoff;
+uniform int u_alpha_mode; // 0 opaque, 1 mask, 2 blend
+out vec4 frag_color;
+void main() {
+    vec4 base = texture(u_texture, v_uv) * u_color;
+    float alpha = 1.0;
+    if (u_alpha_mode == 1) {
+        if (base.a < u_cutoff) discard;
+    } else if (u_alpha_mode == 2) {
+        alpha = base.a;
+        if (alpha < 0.004) discard;
+    }
+    vec3 normal = normalize(v_normal);
+    if (!gl_FrontFacing) normal = -normal;
+    float lit = clamp((dot(normal, u_light) - u_shade_range.x) / max(u_shade_range.y - u_shade_range.x, 1e-4), 0.0, 1.0);
+    frag_color = vec4(base.rgb * mix(u_shade, vec3(1.0), lit), alpha);
+}
+"#;
+
+unsafe fn compile_program(gl: &glow::Context) -> Result<glow::Program, String> {
+    unsafe {
+        let program = gl.create_program()?;
+        for (kind, source) in [(glow::VERTEX_SHADER, VERTEX_SHADER), (glow::FRAGMENT_SHADER, FRAGMENT_SHADER)] {
+            let shader = gl.create_shader(kind)?;
+            gl.shader_source(shader, source);
+            gl.compile_shader(shader);
+            if !gl.get_shader_compile_status(shader) {
+                return Err(format!("VRM shader: {}", gl.get_shader_info_log(shader)));
+            }
+            gl.attach_shader(program, shader);
+            gl.delete_shader(shader);
+        }
+        gl.link_program(program);
+        if !gl.get_program_link_status(program) {
+            return Err(format!("VRM shader link: {}", gl.get_program_info_log(program)));
+        }
+        Ok(program)
+    }
+}

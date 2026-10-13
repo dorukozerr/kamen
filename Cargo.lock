@@ -1782,6 +1782,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "gltf"
+version = "1.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3ce1918195723ce6ac74e80542c5a96a40c2b26162c1957a5cd70799b8cacf7"
+dependencies = [
+ "byteorder",
+ "gltf-json",
+ "lazy_static",
+ "serde_json",
+]
+
+[[package]]
+name = "gltf-derive"
+version = "1.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "14070e711538afba5d6c807edb74bcb84e5dbb9211a3bf5dea0dfab5b24f4c51"
+dependencies = [
+ "inflections",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "gltf-json"
+version = "1.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6176f9d60a7eab0a877e8e96548605dedbde9190a7ae1e80bbcc1c9af03ab14"
+dependencies = [
+ "gltf-derive",
+ "serde",
+ "serde_derive",
+ "serde_json",
+]
+
+[[package]]
 name = "glutin"
 version = "0.32.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2157,50 +2193,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "indextree"
-version = "4.9.2"
+name = "inflections"
+version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3662f57019121dcb767b3d68df6868daf61c8e2ec8205709aea7e75b301a4ecc"
-dependencies = [
- "indextree-macros",
- "serde",
-]
-
-[[package]]
-name = "indextree-macros"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "275f822f43b20b95514c355642157dd8e8214ac62592969e8339d3ebcdacb808"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.9",
-]
-
-[[package]]
-name = "inox2d"
-version = "0.3.0"
-source = "git+https://github.com/Inochi2D/inox2d?rev=d4dd9dd7f16b775042cbda44370570abf9a8cf81#d4dd9dd7f16b775042cbda44370570abf9a8cf81"
-dependencies = [
- "glam",
- "image",
- "indextree",
- "json",
- "simple-tga-reader",
- "thiserror 1.0.69",
- "tracing",
-]
-
-[[package]]
-name = "inox2d-opengl"
-version = "0.3.0"
-dependencies = [
- "glam",
- "glow",
- "inox2d",
- "thiserror 1.0.69",
- "tracing",
-]
+checksum = "a257582fdcde896fd96463bf2d40eefea0580021c0712a0e2b028b60b47a837a"
 
 [[package]]
 name = "interpolate_name"
@@ -2368,12 +2364,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "json"
-version = "0.12.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "078e285eafdfb6c4b434e0d31e8cfcb5115b651496faca5749b88fafd4f23bfd"
-
-[[package]]
 name = "kamen"
 version = "0.1.0"
 dependencies = [
@@ -2383,9 +2373,8 @@ dependencies = [
  "egui-cameras",
  "glam",
  "glow",
+ "gltf",
  "image",
- "inox2d",
- "inox2d-opengl",
  "ipnet",
  "ndarray",
  "ort",
@@ -4405,12 +4394,6 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
-
-[[package]]
-name = "simple-tga-reader"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bad547583b5ef3f75a69312acb93a12c5df278de0540b76196247a313de48d89"
 
 [[package]]
 name = "siphasher"

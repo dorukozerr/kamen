@@ -10,9 +10,8 @@ egui = "0.34.3"
 egui-cameras = { version = "0.3.2", features = ["discover"] }
 glam = "0.29"
 glow = "0.17"
+gltf = { version = "1.4.1", default-features = false, features = ["utils", "names"] }
 image = "0.25.10"
-inox2d = { git = "https://github.com/Inochi2D/inox2d", rev = "d4dd9dd7f16b775042cbda44370570abf9a8cf81", version = "0.3.0" }
-inox2d-opengl = { version = "0.3.0", path = "crates/inox2d-opengl" }
 ipnet = "2.12.2"
 ndarray = "0.17.2"
 ort = { version = "2.0.0-rc.14", features = ["coreml"] }

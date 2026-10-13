@@ -1,88 +1,79 @@
-//! Stage 4: Inochi2D avatar (.inp / .inx) driven by `FaceState`.
+//! Stage 4: the avatar, driven by `FaceState`.
 //!
-//! The puppet is rendered offscreen with `inox2d-opengl` into a framebuffer
-//! whose color texture is registered with egui, so the UI can draw any
-//! background behind it.
+//! Avatars are VRM models (.vrm, e.g. from VRoid Studio), loaded and drawn by
+//! `crate::vrm`. They render offscreen into a framebuffer whose color texture
+//! is registered with egui, so the UI can draw any background behind it.
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
 
 use glam::Vec2;
 use glow::HasContext;
-use inox2d::formats::inp::parse_inp;
-use inox2d::model::Model;
-use inox2d::render::InoxRendererExt;
-use inox2d_opengl::OpenglRenderer;
 
 use crate::face::FaceState;
+use crate::vrm::VrmAvatar;
 
-/// Body follows the head by this fraction, like Inochi Session's defaults.
-const BODY_FOLLOW: f32 = 0.4;
-/// Framing presets (zoom, offset in puppet units) for an Aka-proportioned
-/// puppet. Bust (head and shoulders) is the default.
-pub const BUST_VIEW: (f32, Vec2) = (2.2, Vec2::new(0.0, 1230.0));
-pub const FACE_VIEW: (f32, Vec2) = (4.5, Vec2::new(0.0, 1620.0));
-pub const FULL_BODY_VIEW: (f32, Vec2) = (1.0, Vec2::ZERO);
-/// Puppet units that fit the view height at zoom 1.
-const UNITS_PER_VIEW_HEIGHT: f32 = 5000.0;
-
-#[derive(Clone, Debug)]
-pub struct ParamInfo {
-    pub name: String,
-    pub min: Vec2,
-    pub max: Vec2,
+/// Framing presets.
+#[derive(Clone, Copy)]
+pub enum View {
+    Face,
+    Bust,
+    FullBody,
 }
 
 pub struct Avatar {
     pub name: String,
-    model: Model,
-    pub params: Vec<ParamInfo>,
-    /// Last value written to each bound param, for display.
+    /// Everything the model can be driven by, for display.
+    pub params: Vec<String>,
+    /// Last value written to each driven param, for display.
     pub values: Vec<(String, Vec2)>,
-    renderer: Option<OpenglRenderer>,
-    last_frame: Option<Instant>,
     pub zoom: f32,
-    /// Camera offset in puppet units.
+    /// How far the model is moved from the view center, in meters (x right,
+    /// y down).
     pub offset: Vec2,
+    model: VrmAvatar,
 }
 
 impl Avatar {
     pub fn load(path: &Path) -> Result<Self, String> {
         let data = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        let params = read_params(&data)?;
-        let mut model = parse_inp(data.as_slice()).map_err(|e| format!("parse puppet: {e}"))?;
-        model.puppet.init_transforms();
-        model.puppet.init_rendering();
-        model.puppet.init_params();
-        model.puppet.init_physics();
+        let model = VrmAvatar::load(&data)?;
         let name = model
-            .puppet
-            .meta
             .name
             .clone()
             .or_else(|| path.file_stem().map(|s| s.to_string_lossy().into_owned()))
             .unwrap_or_else(|| "avatar".into());
-        Ok(Self {
+        let mut avatar = Self {
             name,
-            model,
-            params,
+            params: model.param_names(),
             values: Vec::new(),
-            renderer: None,
-            last_frame: None,
-            zoom: BUST_VIEW.0,
-            offset: BUST_VIEW.1,
-        })
+            zoom: 1.0,
+            offset: Vec2::ZERO,
+            model,
+        };
+        avatar.set_view(View::Bust);
+        Ok(avatar)
     }
 
-    pub fn set_view(&mut self, (zoom, offset): (f32, Vec2)) {
-        self.zoom = zoom;
-        self.offset = offset;
+    /// Meters that fit the view height at zoom 1 (the full body).
+    fn units_per_view_height(&self) -> f32 {
+        self.model.height * 1.1
     }
 
-    /// Aka-sized puppets are ~5000 units tall; zoom 1 fits that to the view.
+    pub fn set_view(&mut self, view: View) {
+        // Head size: head joint (base of the skull) to the top.
+        let head = (self.model.height - self.model.head_y).max(0.05);
+        let (visible, center_y) = match view {
+            View::Face => (head * 1.7, self.model.head_y + head * 0.42),
+            View::Bust => (head * 3.4, self.model.head_y + head * 0.05),
+            View::FullBody => (self.units_per_view_height(), self.model.height / 2.0),
+        };
+        self.zoom = self.units_per_view_height() / visible;
+        self.offset = Vec2::new(0.0, center_y);
+    }
+
     fn pixels_per_unit(&self, view_height_px: u32) -> f32 {
-        self.zoom * view_height_px as f32 / UNITS_PER_VIEW_HEIGHT
+        self.zoom * view_height_px as f32 / self.units_per_view_height()
     }
 
     /// Move the view by `delta_px` screen pixels.
@@ -90,7 +81,7 @@ impl Avatar {
         self.offset += delta_px / self.pixels_per_unit(view_height_px);
     }
 
-    /// Zoom by `factor`, keeping the puppet point under `anchor_px` (pixels
+    /// Zoom by `factor`, keeping the model point under `anchor_px` (pixels
     /// from the view center) in place.
     pub fn zoom_at(&mut self, factor: f32, anchor_px: Vec2, view_height_px: u32) {
         let before = self.pixels_per_unit(view_height_px);
@@ -99,125 +90,37 @@ impl Avatar {
         self.offset += anchor_px / after - anchor_px / before;
     }
 
-    /// Pose the puppet from `face` and draw it into `target`.
+    /// Pose the model from `face` and draw it into `target`.
     pub fn render(
         &mut self,
         gl: &Arc<glow::Context>,
         target: &RenderTarget,
         face: &FaceState,
     ) -> Result<(), String> {
-        if self.renderer.is_none() {
-            let renderer = OpenglRenderer::new(gl.clone(), &self.model).map_err(|e| e.to_string())?;
-            self.renderer = Some(renderer);
-        }
-        let pixels_per_unit = self.pixels_per_unit(target.size[1]);
-        let renderer = self.renderer.as_mut().expect("renderer just created");
-        let [w, h] = target.size;
-        renderer.target_framebuffer = Some(target.framebuffer);
-        if renderer.viewport != glam::uvec2(w, h) {
-            renderer.resize(w, h);
-        }
-        renderer.camera.scale = Vec2::splat(pixels_per_unit);
-        renderer.camera.position = self.offset;
-
-        let now = Instant::now();
-        let dt = self
-            .last_frame
-            .map_or(0.0, |t| now.duration_since(t).as_secs_f32().min(0.1));
-        self.last_frame = Some(now);
-
-        let puppet = &mut self.model.puppet;
-        puppet.begin_frame();
+        let view_height = self.units_per_view_height() / self.zoom;
+        // Moving the model right/down is moving the camera left/up.
+        let center = Vec2::new(-self.offset.x, self.offset.y);
         self.values.clear();
-        if let Some(ctx) = puppet.param_ctx.as_mut() {
-            for param in &self.params {
-                if let Some(value) = bind(&param.name, face) {
-                    let value = value.clamp(param.min, param.max);
-                    let _ = ctx.set(&param.name, value);
-                    self.values.push((param.name.clone(), value));
-                }
-            }
-        }
-        puppet.end_frame(dt);
-
-        unsafe {
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(target.framebuffer));
-            gl.viewport(0, 0, w as i32, h as i32);
-            gl.disable(glow::SCISSOR_TEST);
-            gl.color_mask(true, true, true, true);
-            gl.clear_color(0.0, 0.0, 0.0, 0.0);
-            gl.clear(glow::COLOR_BUFFER_BIT | glow::STENCIL_BUFFER_BIT | glow::DEPTH_BUFFER_BIT);
-        }
-        renderer.clear();
-        renderer.on_begin_draw(puppet);
-        renderer.draw(puppet);
-        renderer.on_end_draw(puppet);
+        let result = self.model.draw(
+            gl,
+            target.framebuffer,
+            target.size,
+            center,
+            view_height,
+            face,
+            &mut self.values,
+        );
         // Leave GL the way egui expects it.
         unsafe {
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-            gl.blend_equation(glow::FUNC_ADD);
-            gl.disable(glow::STENCIL_TEST);
             gl.active_texture(glow::TEXTURE0);
             gl.use_program(None);
         }
-        Ok(())
+        result
     }
 }
 
-/// Map a puppet parameter (by Inochi2D's conventional names) to a face value.
-/// Returns `None` for params the face doesn't drive (physics, gaze, ...).
-fn bind(name: &str, face: &FaceState) -> Option<Vec2> {
-    let v = |x: f32, y: f32| Some(Vec2::new(x, y));
-    match name {
-        "Head:: Yaw-Pitch" => v(face.head_yaw, -face.head_pitch),
-        "Head:: Roll" => v(face.head_roll, 0.0),
-        "Body:: Yaw-Pitch" => v(face.head_yaw * BODY_FOLLOW, -face.head_pitch * BODY_FOLLOW),
-        "Body:: Roll" => v(face.head_roll * BODY_FOLLOW, 0.0),
-        "Body:: X:: Move" => v(face.body_x, 0.0),
-        "Eye:: Left:: Blink" => v(face.blink_left, 0.0),
-        "Eye:: Right:: Blink" => v(face.blink_right, 0.0),
-        "Mouth:: Open" => v(face.mouth_open, 0.0),
-        "Mouth:: Shape" => v(face.mouth_width * 0.5 + 0.5, face.mouth_open),
-        "Mouth:: Width" => v(face.mouth_width, 0.0),
-        _ => None,
-    }
-}
-
-/// Read param names and ranges from the puppet's JSON payload; inox2d keeps
-/// its own copy private. Layout: `TRNSRTS\0`, u32 BE length, JSON.
-fn read_params(data: &[u8]) -> Result<Vec<ParamInfo>, String> {
-    const MAGIC: &[u8] = b"TRNSRTS\0";
-    if data.len() < 12 || &data[..8] != MAGIC {
-        return Err("not an Inochi2D puppet (.inp/.inx)".into());
-    }
-    let len = u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
-    let json = data.get(12..12 + len).ok_or("truncated puppet file")?;
-    let root: serde_json::Value =
-        serde_json::from_slice(json).map_err(|e| format!("puppet JSON: {e}"))?;
-    let vec2 = |v: &serde_json::Value| {
-        Vec2::new(
-            v[0].as_f64().unwrap_or(0.0) as f32,
-            v[1].as_f64().unwrap_or(0.0) as f32,
-        )
-    };
-    Ok(root["param"]
-        .as_array()
-        .map(|params| {
-            params
-                .iter()
-                .filter_map(|p| {
-                    Some(ParamInfo {
-                        name: p["name"].as_str()?.to_owned(),
-                        min: vec2(&p["min"]),
-                        max: vec2(&p["max"]),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default())
-}
-
-/// Offscreen framebuffer (RGBA color + depth/stencil for masks) whose color
+/// Offscreen framebuffer (RGBA color + depth/stencil) whose color
 /// texture is shown by egui. Resizing keeps the same texture, so the egui
 /// registration stays valid.
 pub struct RenderTarget {

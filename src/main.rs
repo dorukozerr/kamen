@@ -1,6 +1,7 @@
 mod avatar;
 mod face;
 mod tracker;
+mod vrm;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
@@ -67,7 +68,7 @@ fn main() -> Result<(), eframe::Error> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 820.0])
             .with_transparent(true),
-        // The avatar renderer (inox2d-opengl) needs OpenGL.
+        // The avatar renderer draws with OpenGL.
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
@@ -469,7 +470,7 @@ impl App {
 
     fn pick_avatar(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Inochi2D puppet", &["inp", "inx"])
+            .add_filter("VRM avatar", &["vrm"])
             .pick_file()
         {
             self.load_avatar(&path);
@@ -533,7 +534,7 @@ impl App {
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "Load an Inochi2D avatar (.inp / .inx)",
+                "Load a VRM avatar (.vrm)",
                 egui::FontId::proportional(16.0),
                 ui.visuals().text_color(),
             );
@@ -653,21 +654,21 @@ impl App {
             ui.add(egui::Slider::new(&mut avatar.zoom, 0.1..=20.0).logarithmic(true).text("Zoom"));
             ui.horizontal(|ui| {
                 if ui.small_button("Face").clicked() {
-                    avatar.set_view(avatar::FACE_VIEW);
+                    avatar.set_view(avatar::View::Face);
                 }
                 if ui.small_button("Bust").clicked() {
-                    avatar.set_view(avatar::BUST_VIEW);
+                    avatar.set_view(avatar::View::Bust);
                 }
                 if ui.small_button("Full body").clicked() {
-                    avatar.set_view(avatar::FULL_BODY_VIEW);
+                    avatar.set_view(avatar::View::FullBody);
                 }
             });
             ui.weak("Scroll or pinch to zoom toward the cursor, drag to move.");
             ui.collapsing(format!("Parameters ({})", avatar.params.len()), |ui| {
                 egui::Grid::new("avatar_params").striped(true).show(ui, |ui| {
                     for param in &avatar.params {
-                        ui.label(&param.name);
-                        match avatar.values.iter().find(|(name, _)| *name == param.name) {
+                        ui.label(param);
+                        match avatar.values.iter().find(|(name, _)| name == param) {
                             Some((_, value)) => ui.monospace(format!("{:+.2} {:+.2}", value.x, value.y)),
                             None => ui.weak("not tracked"),
                         };
