@@ -1,3 +1,5 @@
+mod avatar;
+mod face;
 mod tracker;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -62,13 +64,23 @@ const STREAM_CONFIG: StreamConfig = StreamConfig {
 
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 820.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1280.0, 820.0])
+            .with_transparent(true),
+        // The avatar renderer (inox2d-opengl) needs OpenGL.
+        renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
     eframe::run_native(
         "cameras egui demo",
         options,
-        Box::new(|_cc| Ok(Box::new(App::new()))),
+        Box::new(|_cc| {
+            let mut app = App::new();
+            if let Some(path) = std::env::args_os().nth(1) {
+                app.load_avatar(std::path::Path::new(&path));
+            }
+            Ok(Box::new(app))
+        }),
     )
 }
 
@@ -103,6 +115,13 @@ struct App {
     track_result: Option<tracker::TrackResult>,
     camera_fps: FpsCounter,
     track_fps: FpsCounter,
+    face: face::FaceSolver,
+    avatar: Option<avatar::Avatar>,
+    avatar_target: Option<avatar::RenderTarget>,
+    avatar_error: Option<String>,
+    avatar_only: bool,
+    background: Background,
+    background_image: Option<egui::TextureHandle>,
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     discover_open: bool,
     #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -141,6 +160,13 @@ impl App {
             track_result: None,
             camera_fps: FpsCounter::default(),
             track_fps: FpsCounter::default(),
+            face: face::FaceSolver::default(),
+            avatar: None,
+            avatar_target: None,
+            avatar_error: None,
+            avatar_only: false,
+            background: Background::Color(egui::Color32::from_rgb(0, 255, 0)),
+            background_image: None,
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             discover_open: false,
             #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -431,6 +457,227 @@ impl App {
         }
     }
 
+    fn load_avatar(&mut self, path: &std::path::Path) {
+        match avatar::Avatar::load(path) {
+            Ok(avatar) => {
+                self.avatar = Some(avatar);
+                self.avatar_error = None;
+            }
+            Err(error) => self.avatar_error = Some(error),
+        }
+    }
+
+    fn pick_avatar(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Inochi2D puppet", &["inp", "inx"])
+            .pick_file()
+        {
+            self.load_avatar(&path);
+        }
+    }
+
+    fn pick_background_image(&mut self, ctx: &egui::Context) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Image", &["png", "jpg", "jpeg", "webp", "bmp"])
+            .pick_file()
+        else {
+            return;
+        };
+        match image::open(&path) {
+            Ok(image) => {
+                let rgba = image.to_rgba8();
+                let size = [rgba.width() as usize, rgba.height() as usize];
+                let color = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
+                self.background_image =
+                    Some(ctx.load_texture("background", color, egui::TextureOptions::LINEAR));
+                self.background = Background::Image;
+                self.avatar_error = None;
+            }
+            Err(error) => self.avatar_error = Some(format!("Background image: {error}")),
+        }
+    }
+
+    fn show_camera(&self, ui: &mut egui::Ui) {
+        if let Some(stream) = &self.stream {
+            if let Some(image_rect) = show_stream(stream, ui) {
+                self.draw_track_overlay(ui, image_rect);
+            }
+        } else {
+            ui.centered_and_justified(|ui| {
+                ui.label("Pick a source, configure it, and press Connect.");
+            });
+        }
+    }
+
+    fn show_avatar(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let rect = ui.available_rect_before_wrap();
+        let response = ui.allocate_rect(rect, egui::Sense::drag());
+        let painter = ui.painter_at(rect);
+        match self.background {
+            Background::Color(color) => {
+                painter.rect_filled(rect, 0.0, color);
+            }
+            Background::Image => {
+                if let Some(texture) = &self.background_image {
+                    painter.image(
+                        texture.id(),
+                        cover_rect(texture.size_vec2(), rect),
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                }
+            }
+            Background::Transparent => {}
+        }
+        let Some(avatar) = self.avatar.as_mut() else {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Load an Inochi2D avatar (.inp / .inx)",
+                egui::FontId::proportional(16.0),
+                ui.visuals().text_color(),
+            );
+            return;
+        };
+        let Some(gl) = frame.gl().cloned() else {
+            self.avatar_error = Some("Avatar rendering needs the OpenGL renderer".into());
+            return;
+        };
+
+        let pixels_per_point = ui.ctx().pixels_per_point();
+        let size = [
+            (rect.width() * pixels_per_point).round() as u32,
+            (rect.height() * pixels_per_point).round() as u32,
+        ];
+        // Scroll (or pinch) to zoom toward the cursor, drag to move.
+        if let Some(pointer) = response.hover_pos() {
+            let (scroll, pinch) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
+            let factor = (scroll * 0.002).exp() * pinch;
+            if factor != 1.0 {
+                let anchor = (pointer - rect.center()) * pixels_per_point;
+                avatar.zoom_at(factor, glam::Vec2::new(anchor.x, anchor.y), size[1]);
+            }
+        }
+        if response.dragged() {
+            let delta = response.drag_delta() * pixels_per_point;
+            avatar.pan(glam::Vec2::new(delta.x, delta.y), size[1]);
+        }
+
+        let target = match self.avatar_target.as_mut() {
+            Some(target) => {
+                target.resize(&gl, size);
+                target
+            }
+            None => match avatar::RenderTarget::new(&gl, frame, size) {
+                Ok(target) => self.avatar_target.insert(target),
+                Err(error) => {
+                    self.avatar_error = Some(format!("Avatar render target: {error}"));
+                    return;
+                }
+            },
+        };
+        if let Err(error) = avatar.render(&gl, target, &self.face.state) {
+            self.avatar_error = Some(format!("Avatar render: {error}"));
+            self.avatar = None;
+            return;
+        }
+        // GL textures are bottom-up.
+        painter.image(
+            target.texture_id,
+            rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 1.0), egui::pos2(1.0, 0.0)),
+            egui::Color32::WHITE,
+        );
+    }
+
+    fn avatar_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Avatar");
+        ui.horizontal(|ui| {
+            if ui.button("Load avatar…").clicked() {
+                self.pick_avatar();
+            }
+            if let Some(avatar) = &self.avatar {
+                ui.label(&avatar.name);
+            }
+        });
+        if let Some(error) = &self.avatar_error {
+            ui.colored_label(egui::Color32::from_rgb(200, 80, 80), error);
+        }
+        ui.separator();
+
+        let calibrate_label = if self.face.is_calibrating() {
+            "Calibrating… look straight, neutral face"
+        } else {
+            "Calibrate neutral face"
+        };
+        if ui.button(calibrate_label).clicked() {
+            self.face.calibrate();
+        }
+        ui.checkbox(&mut self.face.mirror, "Mirror");
+        if ui.button("Avatar only (Esc to exit)").clicked() {
+            self.avatar_only = true;
+        }
+
+        ui.separator();
+        ui.label("Background");
+        let ctx = ui.ctx().clone();
+        ui.horizontal(|ui| {
+            let is_color = matches!(self.background, Background::Color(_));
+            if ui.selectable_label(is_color, "Color").clicked() && !is_color {
+                self.background = Background::Color(egui::Color32::from_rgb(0, 255, 0));
+            }
+            if ui
+                .selectable_label(matches!(self.background, Background::Image), "Image…")
+                .clicked()
+            {
+                self.pick_background_image(&ctx);
+            }
+            if ui
+                .selectable_label(matches!(self.background, Background::Transparent), "Transparent")
+                .clicked()
+            {
+                self.background = Background::Transparent;
+            }
+        });
+        if let Background::Color(color) = &mut self.background {
+            ui.horizontal(|ui| {
+                ui.color_edit_button_srgba(color);
+                if ui.small_button("Chroma green").clicked() {
+                    *color = egui::Color32::from_rgb(0, 255, 0);
+                }
+            });
+        }
+
+        if let Some(avatar) = &mut self.avatar {
+            ui.separator();
+            ui.add(egui::Slider::new(&mut avatar.zoom, 0.1..=20.0).logarithmic(true).text("Zoom"));
+            ui.horizontal(|ui| {
+                if ui.small_button("Face").clicked() {
+                    avatar.set_view(avatar::FACE_VIEW);
+                }
+                if ui.small_button("Bust").clicked() {
+                    avatar.set_view(avatar::BUST_VIEW);
+                }
+                if ui.small_button("Full body").clicked() {
+                    avatar.set_view(avatar::FULL_BODY_VIEW);
+                }
+            });
+            ui.weak("Scroll or pinch to zoom toward the cursor, drag to move.");
+            ui.collapsing(format!("Parameters ({})", avatar.params.len()), |ui| {
+                egui::Grid::new("avatar_params").striped(true).show(ui, |ui| {
+                    for param in &avatar.params {
+                        ui.label(&param.name);
+                        match avatar.values.iter().find(|(name, _)| *name == param.name) {
+                            Some((_, value)) => ui.monospace(format!("{:+.2} {:+.2}", value.x, value.y)),
+                            None => ui.weak("not tracked"),
+                        };
+                        ui.end_row();
+                    }
+                });
+            });
+        }
+    }
+
     fn build_source(&self) -> Option<CameraSource> {
         match self.source_mode {
             SourceMode::Usb => self
@@ -560,7 +807,15 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        if self.avatar_only && matches!(self.background, Background::Transparent) {
+            [0.0; 4]
+        } else {
+            visuals.panel_fill.to_normalized_gamma_f32()
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if self.autofocus.is_some() {
             self.tick_autofocus(&ctx);
@@ -578,11 +833,23 @@ impl eframe::App for App {
         if let Some(rx) = &self.tracker_rx {
             while let Ok(result) = rx.try_recv() {
                 self.track_fps.tick();
+                self.face.update(&result);
                 self.track_result = Some(result);
             }
         }
         if !self.track_enabled {
             self.track_result = None;
+        }
+
+        if self.avatar_only {
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.avatar_only = false;
+            }
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show_inside(ui, |ui| self.show_avatar(ui, frame));
+            ctx.request_repaint();
+            return;
         }
 
         egui::Panel::top("bar").show_inside(ui, |ui| {
@@ -765,16 +1032,19 @@ impl eframe::App for App {
             });
         }
 
+        egui::Panel::right("avatar")
+            .resizable(true)
+            .default_size(260.0)
+            .show_inside(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| self.avatar_panel(ui));
+            });
+
         egui::CentralPanel::default().show_inside(ui, |ui| {
-            if let Some(stream) = &self.stream {
-                if let Some(image_rect) = show_stream(stream, ui) {
-                    self.draw_track_overlay(ui, image_rect);
-                }
-            } else {
-                ui.centered_and_justified(|ui| {
-                    ui.label("Pick a source, configure it, and press Connect.");
-                });
-            }
+            let (left, right) = ui.available_rect_before_wrap().split_left_right_at_fraction(0.5);
+            ui.scope_builder(egui::UiBuilder::new().max_rect(left), |ui| self.show_camera(ui));
+            ui.scope_builder(egui::UiBuilder::new().max_rect(right), |ui| {
+                self.show_avatar(ui, frame)
+            });
         });
 
         ctx.request_repaint();
@@ -865,6 +1135,19 @@ fn show_stream(stream: &CameraStream, ui: &mut egui::Ui) -> Option<egui::Rect> {
     let width = available.x.min(available.y * aspect);
     let size = egui::vec2(width, width / aspect);
     Some(ui.image((texture.id(), size)).rect)
+}
+
+#[derive(Clone, Copy)]
+enum Background {
+    Color(egui::Color32),
+    Image,
+    Transparent,
+}
+
+/// Rect that covers `area` with an image of `size`, keeping its aspect ratio.
+fn cover_rect(size: egui::Vec2, area: egui::Rect) -> egui::Rect {
+    let scale = (area.width() / size.x).max(area.height() / size.y);
+    egui::Rect::from_center_size(area.center(), size * scale)
 }
 
 #[derive(Default)]
