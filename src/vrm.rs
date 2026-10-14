@@ -26,6 +26,18 @@ const BREATH_ANGLE: f32 = 0.012;
 /// expressions also close or widen the eyes.
 const SMILE_WEIGHT: f32 = 0.7;
 const BROW_WEIGHT: f32 = 0.6;
+/// Subtle expressions: lowered brows borrow a little of `angry`, a frown a
+/// little of `sad`, and narrowed eyes part of a blink.
+const BROW_LOWER_WEIGHT: f32 = 0.35;
+const FROWN_WEIGHT: f32 = 0.4;
+const SQUINT_WEIGHT: f32 = 0.45;
+/// Eye rotation range in radians, and how much of a head turn the eyes
+/// undo so they keep looking toward the viewer.
+const EYE_MAX_YAW: f32 = 0.14;
+const EYE_MAX_PITCH: f32 = 0.09;
+const EYE_COUNTER: f32 = 0.30;
+/// Spine tilt in radians when leaning fully toward the camera.
+const LEAN_ANGLE: f32 = 0.10;
 /// Outline thickness limit in meters. Models thin their outlines with a
 /// width texture we don't read, so the declared width is an upper bound.
 const OUTLINE_MAX: f32 = 0.0015;
@@ -619,11 +631,25 @@ impl VrmAvatar {
                     "neck" => face.breath * BREATH_ANGLE,
                     _ => 0.0,
                 };
-                let bone_pitch = pitch * share + breath;
+                // Leaning in tilts the spine forward; the neck undoes most of
+                // it so the face stays toward the viewer.
+                let lean = match bone {
+                    "spine" => face.lean * LEAN_ANGLE,
+                    "neck" => -face.lean * LEAN_ANGLE * 0.8,
+                    _ => 0.0,
+                };
+                let bone_pitch = pitch * share + breath + lean;
                 self.rotate_bone(bone, Quat::from_euler(EulerRot::YXZ, yaw * share, bone_pitch, roll * share));
                 values.push((format!("Bone: {bone}"), Vec2::new(yaw * share, pitch * share).map(f32::to_degrees)));
             }
         }
+        // Eyes dart a little on their own and turn back against the head, so
+        // the avatar keeps eye contact while its head moves.
+        let eye_yaw = (face.gaze_x * EYE_MAX_YAW - yaw * EYE_COUNTER).clamp(-EYE_MAX_YAW, EYE_MAX_YAW);
+        let eye_pitch = (face.gaze_y * EYE_MAX_PITCH - pitch * EYE_COUNTER).clamp(-EYE_MAX_PITCH, EYE_MAX_PITCH);
+        let eye_rotation = Quat::from_euler(EulerRot::YXZ, eye_yaw, eye_pitch, 0.0);
+        self.rotate_bone("leftEye", eye_rotation);
+        self.rotate_bone("rightEye", eye_rotation);
         self.rotate_bone("leftUpperArm", Quat::from_rotation_z(-ARM_DOWN));
         self.rotate_bone("rightUpperArm", Quat::from_rotation_z(ARM_DOWN));
         if let Some(&hips) = self.bones.get("hips") {
@@ -631,7 +657,7 @@ impl VrmAvatar {
                 Some(parent) => self.nodes[parent].rest_world_rotation,
                 None => self.root_transform.to_scale_rotation_translation().1,
             };
-            let travel = Vec3::new(face.body_x * BODY_TRAVEL, 0.0, 0.0);
+            let travel = Vec3::new(face.body_x, face.body_y * 0.5, face.lean * 0.5) * BODY_TRAVEL;
             self.nodes[hips].translation += parent_rotation.inverse() * travel;
         }
         self.update_world();
@@ -651,8 +677,10 @@ impl VrmAvatar {
         let blink_scale = 1.0 - happy * 0.6;
         for expression in &self.expressions {
             let value = match expression.name.as_str() {
-                "blinkLeft" => face.blink_left * blink_scale,
-                "blinkRight" => face.blink_right * blink_scale,
+                "blinkLeft" => face.blink_left.max(face.eye_squint * SQUINT_WEIGHT) * blink_scale,
+                "blinkRight" => face.blink_right.max(face.eye_squint * SQUINT_WEIGHT) * blink_scale,
+                "angry" => face.brow_lower * BROW_LOWER_WEIGHT,
+                "sad" => face.frown * FROWN_WEIGHT,
                 "aa" => face.mouth_open,
                 "ih" => wide,
                 "ou" => narrow,

@@ -36,6 +36,23 @@ const WINK_DIFFERENCE: f32 = 0.45;
 const SMILE_RANGE: f32 = 0.12;
 const BROW_RANGE: f32 = 0.14;
 const EXPRESSION_DEAD_ZONE: f32 = 0.25;
+/// Mouth-corner drop / eyebrow lowering (in eye distances) for a full value.
+const FROWN_RANGE: f32 = 0.10;
+const BROW_LOWER_RANGE: f32 = 0.10;
+/// Eye closedness (0 open .. 1 shut) where a held narrowing of the eyes
+/// starts and where it counts as full. Blinks are handled separately.
+const SQUINT_START: f32 = 0.15;
+const SQUINT_FULL: f32 = 0.60;
+/// Leaning toward the camera: relative growth of the face that maps to 1.
+const LEAN_RANGE: f32 = 0.35;
+/// Vertical face travel, as a fraction of the frame width, that maps to 1.
+const BODY_Y_RANGE: f32 = 0.20;
+/// Small eye darts while idle: how far (of the eye's range), and how often.
+const SACCADE_X: f32 = 0.30;
+const SACCADE_Y: f32 = 0.15;
+const SACCADE_MIN_SECONDS: f32 = 1.2;
+const SACCADE_EXTRA_SECONDS: f32 = 2.6;
+const GAZE_RATE: f32 = 30.0;
 
 /// How fast the presented state follows its target, per second.
 const HEAD_RATE: f32 = 16.0;
@@ -67,8 +84,19 @@ pub struct FaceState {
     pub mouth_width: f32,
     pub smile: f32,
     pub brow_raise: f32,
+    /// Subtle expressions, 0..1: lowered brows (concentrating), mouth
+    /// corners down, and eyes held narrowed.
+    pub brow_lower: f32,
+    pub frown: f32,
+    pub eye_squint: f32,
+    /// Where the eyes point within their range, -1..1 (right, down).
+    pub gaze_x: f32,
+    pub gaze_y: f32,
     /// Horizontal face position in the frame.
     pub body_x: f32,
+    /// Vertical face position, positive up, and leaning toward the camera.
+    pub body_y: f32,
+    pub lean: f32,
     /// Breathing cycle, -1..1.
     pub breath: f32,
 }
@@ -84,7 +112,9 @@ const MOUTH_WIDTH: usize = 6;
 const SMILE: usize = 7;
 const BROW: usize = 8;
 const X: usize = 9;
-const FEATURE_COUNT: usize = 10;
+const Y: usize = 10;
+const SCALE: usize = 11;
+const FEATURE_COUNT: usize = 12;
 
 /// Raw geometric measurements from one set of landmarks (300-W layout).
 /// Left/right are as seen in the image.
@@ -123,6 +153,8 @@ fn features(points: &[[f32; 2]], frame_w: f32) -> Option<Features> {
     out[SMILE] = mouth_corners - mouth_center;
     out[BROW] = brows;
     out[X] = eye_mid[0] / frame_w * 2.0 - 1.0;
+    out[Y] = eye_mid[1] / frame_w;
+    out[SCALE] = eye_dist / frame_w;
     Some(out)
 }
 
@@ -167,8 +199,9 @@ pub struct FaceSolver {
     neutral: Option<Features>,
     calibration_sum: Features,
     calibration_count: u32,
-    /// yaw, pitch, roll, mouth open, mouth width, smile, brow, x.
-    filters: [OneEuro; 8],
+    /// yaw, pitch, roll, mouth open, mouth width, smile, brow raise, x,
+    /// brow lower, frown, squint, y, lean.
+    filters: [OneEuro; 13],
     last_update: Option<Instant>,
     /// Blink state per eye (image left, image right), with hysteresis.
     eye_closed: [bool; 2],
@@ -181,6 +214,9 @@ pub struct FaceSolver {
     /// Seconds of animation time, for idle motion.
     clock: f32,
     next_blink: f32,
+    /// Current eye-dart target and when the next one is due.
+    gaze: [f32; 2],
+    next_saccade: f32,
     random: u32,
     /// Move like a mirror image (VTuber convention) instead of like the camera view.
     pub mirror: bool,
@@ -197,7 +233,12 @@ impl Default for FaceSolver {
             neutral: None,
             calibration_sum: [0.0; FEATURE_COUNT],
             calibration_count: 0,
-            filters: [head, head, head, mouth, mouth, expression, expression, head],
+            filters: [
+                head, head, head, mouth, mouth, expression, expression, head, expression, expression, expression,
+                head, head,
+            ],
+            gaze: [0.0; 2],
+            next_saccade: 1.5,
             last_update: None,
             eye_closed: [false; 2],
             target: FaceState::default(),
@@ -246,29 +287,6 @@ impl FaceSolver {
             return;
         };
 
-        let expression = |value: f32, range: f32| {
-            ((value / range - EXPRESSION_DEAD_ZONE) / (1.0 - EXPRESSION_DEAD_ZONE)).clamp(0.0, 1.0)
-        };
-        let raw = [
-            ((f[YAW] - n[YAW]) / YAW_RANGE * HEAD_GAIN).clamp(-1.0, 1.0),
-            ((f[PITCH] - n[PITCH]) / PITCH_RANGE * HEAD_GAIN).clamp(-1.0, 1.0),
-            ((f[ROLL] - n[ROLL]) / ROLL_RANGE).clamp(-1.0, 1.0),
-            ((f[MOUTH_GAP] - n[MOUTH_GAP]) / MOUTH_OPEN_RANGE).clamp(0.0, 1.0),
-            ((f[MOUTH_WIDTH] / n[MOUTH_WIDTH].max(1e-3) - 1.0) * MOUTH_WIDTH_GAIN).clamp(-1.0, 1.0),
-            expression(f[SMILE] - n[SMILE], SMILE_RANGE),
-            expression(f[BROW] - n[BROW], BROW_RANGE),
-            (f[X] - n[X]).clamp(-1.0, 1.0),
-        ];
-        let now = Instant::now();
-        let dt = self
-            .last_update
-            .map_or(1.0 / 30.0, |t| now.duration_since(t).as_secs_f32().max(1e-3));
-        self.last_update = Some(now);
-        let mut out = [0.0; 8];
-        for ((o, filter), x) in out.iter_mut().zip(&mut self.filters).zip(raw) {
-            *o = filter.filter(x, dt);
-        }
-
         // Blinks are not smoothed: they snap shut and open, and both eyes
         // move together unless one is clearly more closed (a wink).
         let closedness = |ear: f32, open: f32| {
@@ -288,6 +306,41 @@ impl FaceSolver {
             } else if value < BLINK_OPEN {
                 *closed = false;
             }
+        }
+        // Eyes held partly closed (not a blink) narrow the avatar's eyes. The
+        // slow filter on this value keeps quick blinks out of it.
+        let squint = if self.eye_closed.contains(&true) {
+            0.0
+        } else {
+            (((eyes[0] + eyes[1]) / 2.0 - SQUINT_START) / (SQUINT_FULL - SQUINT_START)).clamp(0.0, 1.0)
+        };
+
+        let expression = |value: f32, range: f32| {
+            ((value / range - EXPRESSION_DEAD_ZONE) / (1.0 - EXPRESSION_DEAD_ZONE)).clamp(0.0, 1.0)
+        };
+        let raw = [
+            ((f[YAW] - n[YAW]) / YAW_RANGE * HEAD_GAIN).clamp(-1.0, 1.0),
+            ((f[PITCH] - n[PITCH]) / PITCH_RANGE * HEAD_GAIN).clamp(-1.0, 1.0),
+            ((f[ROLL] - n[ROLL]) / ROLL_RANGE).clamp(-1.0, 1.0),
+            ((f[MOUTH_GAP] - n[MOUTH_GAP]) / MOUTH_OPEN_RANGE).clamp(0.0, 1.0),
+            ((f[MOUTH_WIDTH] / n[MOUTH_WIDTH].max(1e-3) - 1.0) * MOUTH_WIDTH_GAIN).clamp(-1.0, 1.0),
+            expression(f[SMILE] - n[SMILE], SMILE_RANGE),
+            expression(f[BROW] - n[BROW], BROW_RANGE),
+            (f[X] - n[X]).clamp(-1.0, 1.0),
+            expression(n[BROW] - f[BROW], BROW_LOWER_RANGE),
+            expression(n[SMILE] - f[SMILE], FROWN_RANGE),
+            squint,
+            ((n[Y] - f[Y]) / BODY_Y_RANGE).clamp(-1.0, 1.0),
+            ((f[SCALE] / n[SCALE].max(1e-6) - 1.0) / LEAN_RANGE).clamp(-1.0, 1.0),
+        ];
+        let now = Instant::now();
+        let dt = self
+            .last_update
+            .map_or(1.0 / 30.0, |t| now.duration_since(t).as_secs_f32().max(1e-3));
+        self.last_update = Some(now);
+        let mut out = [0.0; 13];
+        for ((o, filter), x) in out.iter_mut().zip(&mut self.filters).zip(raw) {
+            *o = filter.filter(x, dt);
         }
         let [image_left_eye, image_right_eye] = self.eye_closed.map(|closed| if closed { 1.0 } else { 0.0 });
 
@@ -309,7 +362,14 @@ impl FaceSolver {
             mouth_width: out[4],
             smile: out[5],
             brow_raise: out[6],
+            brow_lower: out[8],
+            frown: out[9],
+            eye_squint: out[10],
+            gaze_x: 0.0,
+            gaze_y: 0.0,
             body_x: out[7] * flip,
+            body_y: out[11],
+            lean: out[12],
             breath: 0.0,
         };
     }
@@ -335,6 +395,17 @@ impl FaceSolver {
             (target.blink_left, target.blink_right) = (blink, blink);
         }
 
+        // Eyes are never perfectly still: every second or three they dart to
+        // a new spot near the center and hold there.
+        if self.clock >= self.next_saccade {
+            self.gaze = [
+                (self.random_unit() * 2.0 - 1.0) * SACCADE_X,
+                (self.random_unit() * 2.0 - 1.0) * SACCADE_Y,
+            ];
+            self.next_saccade = self.clock + SACCADE_MIN_SECONDS + self.random_unit() * SACCADE_EXTRA_SECONDS;
+        }
+        let gaze = self.gaze;
+
         let ease = |value: &mut f32, target: f32, rate: f32| {
             *value += (target - *value) * (1.0 - (-rate * dt).exp());
         };
@@ -349,6 +420,13 @@ impl FaceSolver {
         ease(&mut eased.smile, target.smile, EXPRESSION_RATE);
         ease(&mut eased.brow_raise, target.brow_raise, EXPRESSION_RATE);
         ease(&mut eased.body_x, target.body_x, BODY_RATE);
+        ease(&mut eased.body_y, target.body_y, BODY_RATE);
+        ease(&mut eased.lean, target.lean, BODY_RATE);
+        ease(&mut eased.brow_lower, target.brow_lower, EXPRESSION_RATE);
+        ease(&mut eased.frown, target.frown, EXPRESSION_RATE);
+        ease(&mut eased.eye_squint, target.eye_squint, EXPRESSION_RATE);
+        ease(&mut eased.gaze_x, gaze[0], GAZE_RATE);
+        ease(&mut eased.gaze_y, gaze[1], GAZE_RATE);
 
         // Idle motion on top, so the avatar is never perfectly still.
         let t = self.clock;

@@ -2,6 +2,9 @@
 name = "kamen"
 version = "0.1.0"
 edition = "2024"
+description = "Free VTuber app for macOS: drive a VRM avatar with your face and send it to OBS."
+authors = ["Doruk Özer"]
+license = "WTFPL"
 
 [dependencies]
 cameras = { version = "0.3.2", features = ["analysis", "controls"] }

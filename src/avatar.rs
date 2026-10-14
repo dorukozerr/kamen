@@ -208,6 +208,27 @@ impl RenderTarget {
         }
     }
 
+    /// Send the frame to Syphon clients (OBS). The frame keeps its alpha, so
+    /// render it over a transparent clear color.
+    pub fn publish_syphon(&self, gl: &glow::Context, server: &crate::platform::SyphonServer) {
+        unsafe {
+            // Syphon copies the texture with whatever state is current.
+            gl.viewport(0, 0, self.size[0] as i32, self.size[1] as i32);
+            gl.active_texture(glow::TEXTURE0);
+            gl.disable(glow::BLEND);
+            gl.disable(glow::SCISSOR_TEST);
+            gl.disable(glow::DEPTH_TEST);
+            gl.disable(glow::CULL_FACE);
+            gl.color_mask(true, true, true, true);
+            server.publish(self.color.0.get(), self.size);
+            // Back to what egui expects.
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            gl.bind_vertex_array(None);
+            gl.use_program(None);
+            gl.enable(glow::BLEND);
+        }
+    }
+
     /// Copy the frame straight into the window's framebuffer, scaled to
     /// `window_size` pixels. Used while egui isn't painting the window.
     pub fn blit_to_window(&self, gl: &glow::Context, window_size: [u32; 2]) {

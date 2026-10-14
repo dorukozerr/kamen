@@ -6,69 +6,55 @@ mod vrm;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
-use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-use cameras::Credentials;
-use cameras::analysis;
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-use cameras::discover::DiscoverConfig;
-use cameras::{
-    Camera, CameraSource, ControlCapabilities, ControlKind, ControlRange, Controls, Device,
-    PixelFormat, Rect, Resolution, StreamConfig,
-};
+use cameras::{Camera, CameraSource, Device, PixelFormat, Resolution, StreamConfig};
 use eframe::egui;
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-use egui_cameras::{DiscoverySession, poll_discovery, show_discovery, start_discovery};
-use egui_cameras::{Pump, capture_frame, set_active};
-use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
-
-type ApplyRequest = (Device, Controls);
-
-struct AutofocusState {
-    focus_min: f32,
-    focus_max: f32,
-    step: f32,
-    total_samples: u32,
-    sample_index: u32,
-    best: Option<(f32, f32)>,
-    phase: AutofocusPhase,
-}
-
-enum AutofocusPhase {
-    Apply,
-    Settle(Instant),
-    Sample,
-    Finalize,
-}
-
-impl AutofocusState {
-    fn focus_at(&self, index: u32) -> f32 {
-        (self.focus_min + index as f32 * self.step).min(self.focus_max)
-    }
-}
-
-const SHARPEST_BURST_SIZE: usize = 16;
-const SHARPEST_BURST_INTERVAL: Duration = Duration::from_millis(30);
-const AUTOFOCUS_SETTLE: Duration = Duration::from_millis(100);
-const AUTOFOCUS_SWEEP_STRIDE_MULTIPLIER: f32 = 4.0;
-const AUTOFOCUS_CONTINUOUS_SAMPLES: f32 = 20.0;
+use egui_cameras::Pump;
 
 const STREAM_CONFIG: StreamConfig = StreamConfig {
     resolution: Resolution {
         width: 1280,
         height: 720,
     },
-    framerate: 60,
+    framerate: 30,
     pixel_format: PixelFormat::Bgra8,
 };
+
+/// Avatar loaded at startup, relative to the project folder or to
+/// `Contents/Resources` in the macOS app bundle.
+const DEFAULT_AVATAR: &str = "models/vrm/nihil.vrm";
+
+/// Time between drawn frames. Buffer swaps don't wait for the display
+/// (`vsync: false`), so this is what paces the app.
+const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+const LOW_FPS_FRAME_INTERVAL: Duration = Duration::from_millis(33);
+/// Camera frames wider than this are halved for the preview.
+const PREVIEW_MAX_WIDTH: usize = 1280;
+/// Longest side of the avatar render, in pixels.
+const AVATAR_MAX_RENDER_SIDE: f32 = 1600.0;
+
+/// Where the Donate button leads.
+const DONATE_URL: &str = "https://doruk.wtf";
+
+const SIDEBAR_WIDTH: f32 = 272.0;
+const CANVAS: egui::Color32 = egui::Color32::from_rgb(24, 25, 29);
+const SURFACE: egui::Color32 = egui::Color32::from_rgb(32, 33, 38);
+const CONTROL: egui::Color32 = egui::Color32::from_rgb(46, 48, 55);
+const CONTROL_HOVER: egui::Color32 = egui::Color32::from_rgb(58, 60, 69);
+const ACCENT: egui::Color32 = egui::Color32::from_rgb(124, 108, 246);
+const TEXT: egui::Color32 = egui::Color32::from_rgb(232, 233, 238);
+const TEXT_DIM: egui::Color32 = egui::Color32::from_rgb(140, 143, 155);
+const GOOD: egui::Color32 = egui::Color32::from_rgb(84, 200, 130);
+const WARN: egui::Color32 = egui::Color32::from_rgb(232, 180, 80);
+const BAD: egui::Color32 = egui::Color32::from_rgb(226, 96, 96);
+const CHROMA_GREEN: egui::Color32 = egui::Color32::from_rgb(0, 255, 0);
 
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 820.0])
-            .with_transparent(true),
+            .with_inner_size([1080.0, 720.0])
+            .with_min_inner_size([640.0, 480.0]),
         // The avatar renderer draws with OpenGL.
         renderer: eframe::Renderer::Glow,
         // Don't wait for the display when swapping buffers. A window that is
@@ -81,8 +67,9 @@ fn main() -> Result<(), eframe::Error> {
     eframe::run_native(
         "Kamen",
         options,
-        Box::new(|_cc| {
+        Box::new(|cc| {
             platform::disable_app_nap();
+            apply_theme(&cc.egui_ctx);
             let mut app = App::new();
             // An avatar given on the command line wins over the default one.
             match std::env::args_os().nth(1) {
@@ -93,37 +80,65 @@ fn main() -> Result<(), eframe::Error> {
                     }
                 }
             }
+            app.connect();
             Ok(Box::new(app))
         }),
     )
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum SourceMode {
-    Usb,
-    Rtsp,
+/// Dark, quiet look: one accent color, rounded controls, roomy spacing.
+fn apply_theme(ctx: &egui::Context) {
+    ctx.set_theme(egui::Theme::Dark);
+    ctx.all_styles_mut(|style| {
+        style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+        style.spacing.button_padding = egui::vec2(12.0, 6.0);
+        style.spacing.interact_size.y = 28.0;
+        for (text_style, size) in [
+            (egui::TextStyle::Heading, 20.0),
+            (egui::TextStyle::Body, 13.5),
+            (egui::TextStyle::Button, 13.5),
+            (egui::TextStyle::Small, 11.0),
+        ] {
+            style
+                .text_styles
+                .insert(text_style, egui::FontId::proportional(size));
+        }
+
+        let visuals = &mut style.visuals;
+        visuals.panel_fill = SURFACE;
+        visuals.window_fill = SURFACE;
+        visuals.extreme_bg_color = CANVAS;
+        visuals.override_text_color = Some(TEXT);
+        visuals.selection.bg_fill = ACCENT;
+        visuals.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
+        visuals.hyperlink_color = ACCENT;
+        let radius = egui::CornerRadius::same(8);
+        for (widget, fill) in [
+            (&mut visuals.widgets.noninteractive, SURFACE),
+            (&mut visuals.widgets.inactive, CONTROL),
+            (&mut visuals.widgets.hovered, CONTROL_HOVER),
+            (&mut visuals.widgets.active, ACCENT),
+            (&mut visuals.widgets.open, CONTROL_HOVER),
+        ] {
+            widget.corner_radius = radius;
+            widget.bg_fill = fill;
+            widget.weak_bg_fill = fill;
+            widget.bg_stroke = egui::Stroke::NONE;
+            widget.fg_stroke = egui::Stroke::new(1.0_f32, TEXT);
+            widget.expansion = 0.0;
+        }
+        visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, CONTROL);
+    });
 }
 
 struct App {
     devices: Vec<Device>,
     selected_device: usize,
-    source_mode: SourceMode,
-    rtsp_url: String,
-    rtsp_username: String,
-    rtsp_password: String,
-
     stream: Option<CameraStream>,
-    active: bool,
-    status: String,
-    last_capture: Option<String>,
-    capabilities: Option<ControlCapabilities>,
-    capabilities_error: Option<String>,
-    pending_controls: Controls,
-    current_controls: Controls,
-    apply_tx: mpsc::Sender<ApplyRequest>,
-    live_apply: bool,
-    autofocus: Option<AutofocusState>,
-    track_enabled: bool,
+    camera_error: Option<String>,
+    /// Show the camera picture in the sidebar. Off by default: converting
+    /// and uploading camera frames costs more than the tracking itself.
+    show_preview: bool,
     track_flag: Arc<AtomicBool>,
     /// Whether the camera preview is on screen; the camera thread skips
     /// converting frames for it otherwise.
@@ -133,368 +148,60 @@ struct App {
     camera_fps: FpsCounter,
     track_fps: FpsCounter,
     face: face::FaceSolver,
+
     avatar: Option<avatar::Avatar>,
     avatar_target: Option<avatar::RenderTarget>,
     avatar_error: Option<String>,
+    /// Sidebar hidden: the window shows only the avatar.
     avatar_only: bool,
+    background: Background,
+    background_image: Option<egui::TextureHandle>,
+
     /// Float above other windows. A fully covered window stops being drawn,
     /// which freezes it in OBS's window capture.
     keep_on_top: bool,
     /// Draw at 30 fps instead of 60, for less CPU and GPU use.
     low_fps: bool,
+    /// Send avatar frames to OBS through Syphon. The server is created on
+    /// the first frame after this is turned on.
+    syphon_enabled: bool,
+    syphon: Option<platform::SyphonServer>,
+    syphon_error: Option<String>,
     hidden_log: HiddenLog,
     /// The window was hidden on the last frame (for logging the change).
     presenting_hidden: bool,
-    background: Background,
-    background_image: Option<egui::TextureHandle>,
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    discover_open: bool,
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    discover_subnet: String,
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    discover_error: Option<String>,
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    discovery: Option<DiscoverySession>,
 }
 
 impl App {
     fn new() -> Self {
-        let devices = cameras::devices().unwrap_or_default();
-        let apply_tx = spawn_apply_worker();
+        let mut face = face::FaceSolver::default();
+        face.mirror = false;
         Self {
-            devices,
+            devices: cameras::devices().unwrap_or_default(),
             selected_device: 0,
-            source_mode: SourceMode::Usb,
-            rtsp_url: "rtsp://127.0.0.1:8554/live".into(),
-            rtsp_username: String::new(),
-            rtsp_password: String::new(),
             stream: None,
-            active: true,
-            status: "Idle".into(),
-            last_capture: None,
-            capabilities: None,
-            capabilities_error: None,
-            pending_controls: Controls::default(),
-            current_controls: Controls::default(),
-            apply_tx,
-            live_apply: false,
-            autofocus: None,
-            track_enabled: true,
+            camera_error: None,
+            show_preview: false,
             track_flag: Arc::new(AtomicBool::new(true)),
-            preview_flag: Arc::new(AtomicBool::new(true)),
+            preview_flag: Arc::new(AtomicBool::new(false)),
             tracker_rx: None,
             track_result: None,
             camera_fps: FpsCounter::default(),
             track_fps: FpsCounter::default(),
-            face: face::FaceSolver::default(),
+            face,
             avatar: None,
             avatar_target: None,
             avatar_error: None,
             avatar_only: false,
+            background: Background::Color(CANVAS),
+            background_image: None,
             keep_on_top: false,
-            low_fps: false,
+            low_fps: true,
+            syphon_enabled: true,
+            syphon: None,
+            syphon_error: None,
             hidden_log: HiddenLog::default(),
             presenting_hidden: false,
-            background: Background::Color(egui::Color32::from_rgb(0, 255, 0)),
-            background_image: None,
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
-            discover_open: false,
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
-            discover_subnet: "192.168.1.0/24".into(),
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
-            discover_error: None,
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
-            discovery: None,
-        }
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    fn render_discover(&mut self, ui: &mut egui::Ui) {
-        let running = self
-            .discovery
-            .as_ref()
-            .map(|session| !session.done)
-            .unwrap_or(false);
-        ui.horizontal(|ui| {
-            ui.label("Targets");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.discover_subnet)
-                    .hint_text("CIDR or host:port, comma-separated")
-                    .desired_width(280.0),
-            );
-            let start_enabled = !running;
-            if ui
-                .add_enabled(start_enabled, egui::Button::new("Scan"))
-                .clicked()
-            {
-                self.start_discover();
-            }
-            if ui
-                .add_enabled(running, egui::Button::new("Cancel"))
-                .clicked()
-            {
-                self.discovery = None;
-            }
-            if let Some(message) = &self.discover_error {
-                ui.colored_label(egui::Color32::from_rgb(200, 80, 80), message);
-            }
-        });
-        let clicked = self
-            .discovery
-            .as_ref()
-            .and_then(|session| show_discovery(session, ui));
-        if let Some(camera) = clicked {
-            self.open_discovered(camera);
-        }
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    fn start_discover(&mut self) {
-        let (subnets, endpoints) = match parse_targets(&self.discover_subnet) {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                self.discover_error = Some(error);
-                return;
-            }
-        };
-        let config = DiscoverConfig {
-            subnets,
-            endpoints,
-            ..Default::default()
-        };
-        match start_discovery(config) {
-            Ok(session) => {
-                self.discovery = Some(session);
-                self.discover_error = None;
-            }
-            Err(error) => {
-                self.discover_error = Some(format!("Start failed: {error}"));
-            }
-        }
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    fn open_discovered(&mut self, camera: cameras::discover::DiscoveredCamera) {
-        let CameraSource::Rtsp { url, .. } = &camera.source else {
-            return;
-        };
-        self.source_mode = SourceMode::Rtsp;
-        self.rtsp_url = url.clone();
-        self.rtsp_username.clear();
-        self.rtsp_password.clear();
-        self.connect();
-    }
-
-    fn queue_apply(&self) {
-        let Some(device) = self.devices.get(self.selected_device) else {
-            return;
-        };
-        let _ = self
-            .apply_tx
-            .send((device.clone(), self.pending_controls.clone()));
-    }
-
-    fn refresh_capabilities(&mut self) {
-        self.capabilities = None;
-        self.capabilities_error = None;
-        self.pending_controls = Controls::default();
-        self.current_controls = Controls::default();
-        if self.source_mode != SourceMode::Usb {
-            return;
-        }
-        let Some(device) = self.devices.get(self.selected_device) else {
-            return;
-        };
-        match cameras::control_capabilities(device) {
-            Ok(caps) => {
-                self.current_controls = cameras::read_controls(device).unwrap_or_default();
-                self.capabilities = Some(caps);
-            }
-            Err(error) => self.capabilities_error = Some(error.to_string()),
-        }
-    }
-
-    fn start_autofocus(&mut self) {
-        if self.autofocus.is_some() {
-            return;
-        }
-        if self.stream.is_none() {
-            return;
-        }
-        let Some(device) = self.devices.get(self.selected_device).cloned() else {
-            return;
-        };
-        let Some(caps) = self.capabilities.clone() else {
-            self.last_capture = Some("No capabilities".into());
-            return;
-        };
-        let Some(focus_range) = caps.focus else {
-            self.last_capture = Some("Camera has no controllable focus".into());
-            return;
-        };
-        if let Err(error) = cameras::apply_controls(
-            &device,
-            &Controls {
-                auto_focus: Some(false),
-                auto_exposure: Some(false),
-                auto_white_balance: Some(false),
-                ..Default::default()
-            },
-        ) {
-            self.last_capture = Some(format!("Autofocus setup failed: {error}"));
-            return;
-        }
-
-        let step = if focus_range.step > 0.0 {
-            focus_range.step * AUTOFOCUS_SWEEP_STRIDE_MULTIPLIER
-        } else {
-            ((focus_range.max - focus_range.min) / AUTOFOCUS_CONTINUOUS_SAMPLES).max(f32::EPSILON)
-        };
-        let span = (focus_range.max - focus_range.min).max(0.0);
-        let total_samples = (span / step).floor() as u32 + 1;
-
-        self.autofocus = Some(AutofocusState {
-            focus_min: focus_range.min,
-            focus_max: focus_range.max,
-            step,
-            total_samples,
-            sample_index: 0,
-            best: None,
-            phase: AutofocusPhase::Apply,
-        });
-        self.last_capture = Some(format!("Autofocus: sweeping {total_samples} samples"));
-    }
-
-    fn tick_autofocus(&mut self, ctx: &egui::Context) {
-        let Some(mut state) = self.autofocus.take() else {
-            return;
-        };
-        let Some(stream) = self.stream.as_ref() else {
-            self.autofocus = None;
-            self.last_capture = Some("Autofocus cancelled (stream closed)".into());
-            return;
-        };
-        let Some(device) = self.devices.get(self.selected_device).cloned() else {
-            self.autofocus = None;
-            return;
-        };
-
-        match state.phase {
-            AutofocusPhase::Apply => {
-                let focus_value = state.focus_at(state.sample_index);
-                if cameras::apply_controls(
-                    &device,
-                    &Controls {
-                        focus: Some(focus_value),
-                        ..Default::default()
-                    },
-                )
-                .is_err()
-                {
-                    self.last_capture = Some("Autofocus: apply failed".into());
-                    self.autofocus = None;
-                    return;
-                }
-                state.phase = AutofocusPhase::Settle(Instant::now());
-                self.autofocus = Some(state);
-                ctx.request_repaint_after(AUTOFOCUS_SETTLE);
-            }
-            AutofocusPhase::Settle(start) => {
-                if start.elapsed() >= AUTOFOCUS_SETTLE {
-                    state.phase = AutofocusPhase::Sample;
-                }
-                self.autofocus = Some(state);
-                ctx.request_repaint_after(Duration::from_millis(16));
-            }
-            AutofocusPhase::Sample => {
-                let focus_value = state.focus_at(state.sample_index);
-                if let Some(frame) = capture_frame(&stream.pump) {
-                    let roi = Rect {
-                        x: frame.width / 4,
-                        y: frame.height / 4,
-                        width: frame.width / 2,
-                        height: frame.height / 2,
-                    };
-                    let variance = analysis::blur_variance_in(&frame, roi);
-                    if state.best.is_none_or(|(_, score)| variance > score) {
-                        state.best = Some((focus_value, variance));
-                    }
-                }
-                state.sample_index += 1;
-                if state.sample_index >= state.total_samples {
-                    state.phase = AutofocusPhase::Finalize;
-                } else {
-                    state.phase = AutofocusPhase::Apply;
-                }
-                self.autofocus = Some(state);
-                ctx.request_repaint();
-            }
-            AutofocusPhase::Finalize => match state.best {
-                Some((winner, score)) => {
-                    let _ = cameras::apply_controls(
-                        &device,
-                        &Controls {
-                            focus: Some(winner),
-                            ..Default::default()
-                        },
-                    );
-                    self.pending_controls.focus = Some(winner);
-                    self.pending_controls.auto_focus = Some(false);
-                    self.last_capture = Some(format!(
-                        "Autofocus locked at {winner:.2} (variance {score:.1})"
-                    ));
-                    self.autofocus = None;
-                    ctx.request_repaint();
-                }
-                None => {
-                    self.last_capture = Some("Autofocus: no samples captured".into());
-                    self.autofocus = None;
-                }
-            },
-        }
-    }
-
-    fn draw_track_overlay(&self, ui: &mut egui::Ui, image_rect: egui::Rect) {
-        let Some(result) = &self.track_result else {
-            return;
-        };
-        let Some(head) = &result.head else {
-            return;
-        };
-        let scale_x = image_rect.width() / result.frame_w as f32;
-        let scale_y = image_rect.height() / result.frame_h as f32;
-        let to_screen = |x: f32, y: f32| {
-            egui::pos2(
-                image_rect.left() + x * scale_x,
-                image_rect.top() + y * scale_y,
-            )
-        };
-        let painter = ui.painter();
-        let stroke = egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(80, 200, 120));
-        let p1 = to_screen(head.rect[0], head.rect[1]);
-        let p2 = to_screen(head.rect[2], head.rect[3]);
-        painter.rect_stroke(
-            egui::Rect::from_min_max(p1, p2),
-            0.0,
-            stroke,
-            egui::StrokeKind::Outside,
-        );
-        for point in &head.points {
-            painter.circle_filled(
-                to_screen(point[0], point[1]),
-                3.0,
-                egui::Color32::from_rgb(255, 0, 255),
-            );
-        }
-    }
-
-    fn load_avatar(&mut self, path: &std::path::Path) {
-        match avatar::Avatar::load(path) {
-            Ok(avatar) => {
-                self.avatar = Some(avatar);
-                self.avatar_error = None;
-            }
-            Err(error) => self.avatar_error = Some(error),
         }
     }
 
@@ -506,13 +213,46 @@ impl App {
         }
     }
 
-    fn apply_window_level(&self, ctx: &egui::Context) {
-        let level = if self.keep_on_top {
-            egui::WindowLevel::AlwaysOnTop
-        } else {
-            egui::WindowLevel::Normal
+    /// Open the selected camera and start tracking.
+    fn connect(&mut self) {
+        self.stream = None;
+        self.tracker_rx = None;
+        self.track_result = None;
+        let Some(device) = self.devices.get(self.selected_device).cloned() else {
+            self.camera_error = Some("No camera found".into());
+            return;
         };
-        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+        match cameras::open_source(CameraSource::Usb(device), STREAM_CONFIG) {
+            Ok(camera) => {
+                let (tracker_tx, tracker_rx) = tracker::spawn_tracker();
+                self.stream = Some(spawn_stream(
+                    camera,
+                    tracker_tx,
+                    self.track_flag.clone(),
+                    self.preview_flag.clone(),
+                ));
+                self.tracker_rx = Some(tracker_rx);
+                self.camera_error = None;
+            }
+            Err(error) => self.camera_error = Some(format!("Camera: {error}")),
+        }
+    }
+
+    fn refresh_devices(&mut self) {
+        self.devices = cameras::devices().unwrap_or_default();
+        if self.selected_device >= self.devices.len() {
+            self.selected_device = 0;
+        }
+    }
+
+    fn load_avatar(&mut self, path: &std::path::Path) {
+        match avatar::Avatar::load(path) {
+            Ok(avatar) => {
+                self.avatar = Some(avatar);
+                self.avatar_error = None;
+            }
+            Err(error) => self.avatar_error = Some(error),
+        }
     }
 
     fn pick_avatar(&mut self) {
@@ -545,16 +285,33 @@ impl App {
         }
     }
 
-    fn show_camera(&self, ui: &mut egui::Ui) {
-        if let Some(stream) = &self.stream {
-            if let Some(image_rect) = show_stream(stream, ui) {
-                self.draw_track_overlay(ui, image_rect);
-            }
+    fn apply_window_level(&self, ctx: &egui::Context) {
+        let level = if self.keep_on_top {
+            egui::WindowLevel::AlwaysOnTop
         } else {
-            ui.centered_and_justified(|ui| {
-                ui.label("Pick a source, configure it, and press Connect.");
-            });
+            egui::WindowLevel::Normal
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+    }
+
+    /// One-line tracking state for the sidebar: a color and a sentence.
+    fn status(&self) -> (egui::Color32, String) {
+        if let Some(error) = &self.camera_error {
+            return (BAD, error.clone());
         }
+        if self.stream.is_none() {
+            return (TEXT_DIM, "Camera off".into());
+        }
+        let Some(result) = &self.track_result else {
+            return (WARN, "Starting tracking…".into());
+        };
+        if result.head.is_none() {
+            return (WARN, "No face in view".into());
+        }
+        if self.face.is_calibrating() {
+            return (WARN, "Calibrating: look straight ahead".into());
+        }
+        (GOOD, format!("Tracking at {:.0} fps", self.track_fps.fps))
     }
 
     fn show_avatar(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -575,15 +332,14 @@ impl App {
                     );
                 }
             }
-            Background::Transparent => {}
         }
         let Some(avatar) = self.avatar.as_mut() else {
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "Load a VRM avatar (.vrm)",
-                egui::FontId::proportional(16.0),
-                ui.visuals().text_color(),
+                "Choose a VRM avatar to begin",
+                egui::FontId::proportional(15.0),
+                TEXT_DIM,
             );
             return;
         };
@@ -634,6 +390,9 @@ impl App {
             self.avatar = None;
             return;
         }
+        if let Some(server) = &self.syphon {
+            target.publish_syphon(&gl, server);
+        }
         // GL textures are bottom-up.
         painter.image(
             target.texture_id,
@@ -643,9 +402,26 @@ impl App {
         );
     }
 
-    /// Draw the avatar-only view straight into the window and present it.
-    /// eframe paints nothing while the window is hidden, which would freeze
-    /// the picture OBS captures from it.
+    /// Start or stop the Syphon server to match the switch. Runs in `logic`,
+    /// where the OpenGL context is current.
+    fn update_syphon(&mut self) {
+        if !self.syphon_enabled {
+            self.syphon = None;
+            return;
+        }
+        if self.syphon.is_none() && self.syphon_error.is_none() {
+            match platform::SyphonServer::new(c"Avatar") {
+                Ok(server) => self.syphon = Some(server),
+                Err(error) => {
+                    self.syphon_error = Some(error);
+                    self.syphon_enabled = false;
+                }
+            }
+        }
+    }
+
+    /// Draw the avatar while the window is hidden. eframe paints nothing
+    /// then, which would freeze the picture OBS gets.
     fn present_while_hidden(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let (Some(avatar), Some(target), Some(gl)) = (
             self.avatar.as_mut(),
@@ -654,12 +430,22 @@ impl App {
         ) else {
             return;
         };
+        // With Syphon on, OBS gets the avatar from Syphon (transparent
+        // background), so the window itself doesn't need drawing.
+        if let Some(server) = &self.syphon {
+            if avatar
+                .render(&gl, target, [0.0; 4], &self.face.state)
+                .is_ok()
+            {
+                target.publish_syphon(&gl, server);
+            }
+            return;
+        }
         // The background image is an egui texture, which only egui can draw;
         // it shows as black here.
         let clear = match self.background {
             Background::Color(color) => color.to_normalized_gamma_f32(),
             Background::Image => [0.0, 0.0, 0.0, 1.0],
-            Background::Transparent => [0.0; 4],
         };
         if avatar.render(&gl, target, clear, &self.face.state).is_err() {
             return;
@@ -671,53 +457,122 @@ impl App {
         self.hidden_log.frame(presented);
     }
 
-    fn avatar_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Avatar");
+    fn sidebar(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(4.0);
+        ui.heading("Kamen");
+        let (color, text) = self.status();
         ui.horizontal(|ui| {
-            if ui.button("Load avatar…").clicked() {
-                self.pick_avatar();
-            }
-            if let Some(avatar) = &self.avatar {
-                ui.label(&avatar.name);
-            }
+            let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+            ui.painter().circle_filled(dot.center(), 4.0, color);
+            ui.label(egui::RichText::new(text).color(TEXT_DIM));
+        });
+
+        section(ui, "Avatar");
+        ui.horizontal(|ui| {
+            let name = self
+                .avatar
+                .as_ref()
+                .map_or("None", |avatar| avatar.name.as_str());
+            ui.label(name);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Change…").clicked() {
+                    self.pick_avatar();
+                }
+            });
         });
         if let Some(error) = &self.avatar_error {
-            ui.colored_label(egui::Color32::from_rgb(200, 80, 80), error);
+            ui.colored_label(BAD, error);
         }
-        ui.separator();
+        if let Some(avatar) = &mut self.avatar {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Framing").color(TEXT_DIM));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    for (label, view) in [
+                        ("Full", avatar::View::FullBody),
+                        ("Bust", avatar::View::Bust),
+                        ("Face", avatar::View::Face),
+                    ] {
+                        if ui.button(label).clicked() {
+                            avatar.set_view(view);
+                        }
+                    }
+                });
+            });
+            hint(ui, "Scroll to zoom, drag to move.");
+        }
 
-        let calibrate_label = if self.face.is_calibrating() {
-            "Calibrating… look straight, neutral face"
+        section(ui, "Camera");
+        let mut reconnect = false;
+        let selected = self
+            .devices
+            .get(self.selected_device)
+            .map_or("No camera", |device| device.name.as_str())
+            .to_owned();
+        egui::ComboBox::from_id_salt("camera")
+            .selected_text(selected)
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                for (index, device) in self.devices.iter().enumerate() {
+                    if ui
+                        .selectable_value(&mut self.selected_device, index, &device.name)
+                        .changed()
+                    {
+                        reconnect = true;
+                    }
+                }
+                if ui
+                    .selectable_label(false, "Look for cameras again")
+                    .clicked()
+                {
+                    reconnect = true;
+                }
+            });
+        if reconnect {
+            self.refresh_devices();
+            self.connect();
+        }
+        switch_row(ui, "Show camera", &mut self.show_preview);
+        if self.show_preview {
+            self.camera_preview(ui);
+        }
+
+        section(ui, "Tracking");
+        switch_row(ui, "Mirror", &mut self.face.mirror);
+        let calibrate = if self.face.is_calibrating() {
+            "Calibrating…"
         } else {
-            "Calibrate neutral face"
+            "Recalibrate"
         };
-        if ui.button(calibrate_label).clicked() {
+        if ui
+            .add_sized([ui.available_width(), 28.0], egui::Button::new(calibrate))
+            .on_hover_text("Look straight ahead with a relaxed face, then click.")
+            .clicked()
+        {
             self.face.calibrate();
         }
-        ui.checkbox(&mut self.face.mirror, "Mirror");
-        if ui
-            .checkbox(&mut self.keep_on_top, "Keep on top")
-            .on_hover_text(
-                "Keeps the avatar moving in OBS. A window that is completely covered by \
-                 other windows stops being drawn, so its capture freezes.",
-            )
-            .changed()
-        {
-            self.apply_window_level(ui.ctx());
-        }
-        ui.checkbox(&mut self.low_fps, "30 fps (lighter)")
-            .on_hover_text("Draws 30 frames a second instead of 60. Roughly halves CPU and GPU use.");
-        if ui.button("Avatar only (Esc to exit)").clicked() {
-            self.avatar_only = true;
-        }
 
-        ui.separator();
-        ui.label("Background");
+        section(ui, "Output");
+        if switch_row(ui, "Send to OBS", &mut self.syphon_enabled).changed() {
+            self.syphon_error = None;
+        }
+        match &self.syphon_error {
+            Some(error) => {
+                ui.colored_label(BAD, error);
+            }
+            None if self.syphon_enabled => {
+                hint(ui, "In OBS, add a Syphon Client source and pick Kamen.");
+            }
+            None => {}
+        }
+        switch_row(ui, "30 fps", &mut self.low_fps)
+            .on_hover_text("Off draws 60 frames a second, for about twice the CPU and GPU use.");
+
+        section(ui, "Background");
         let ctx = ui.ctx().clone();
         ui.horizontal(|ui| {
             let is_color = matches!(self.background, Background::Color(_));
             if ui.selectable_label(is_color, "Color").clicked() && !is_color {
-                self.background = Background::Color(egui::Color32::from_rgb(0, 255, 0));
+                self.background = Background::Color(CANVAS);
             }
             if ui
                 .selectable_label(matches!(self.background, Background::Image), "Image…")
@@ -725,205 +580,112 @@ impl App {
             {
                 self.pick_background_image(&ctx);
             }
-            if ui
-                .selectable_label(
-                    matches!(self.background, Background::Transparent),
-                    "Transparent",
-                )
-                .clicked()
-            {
-                self.background = Background::Transparent;
-            }
         });
         if let Background::Color(color) = &mut self.background {
             ui.horizontal(|ui| {
                 ui.color_edit_button_srgba(color);
-                if ui.small_button("Chroma green").clicked() {
-                    *color = egui::Color32::from_rgb(0, 255, 0);
+                if ui.button("Dark").clicked() {
+                    *color = CANVAS;
+                }
+                if ui.button("Green").clicked() {
+                    *color = CHROMA_GREEN;
                 }
             });
         }
+        hint(
+            ui,
+            "Only seen in this window. OBS gets a transparent background.",
+        );
 
-        if let Some(avatar) = &mut self.avatar {
-            ui.separator();
-            ui.add(
-                egui::Slider::new(&mut avatar.zoom, 0.1..=20.0)
-                    .logarithmic(true)
-                    .text("Zoom"),
-            );
-            ui.horizontal(|ui| {
-                if ui.small_button("Face").clicked() {
-                    avatar.set_view(avatar::View::Face);
+        ui.add_space(12.0);
+        egui::CollapsingHeader::new(egui::RichText::new("Advanced").color(TEXT_DIM)).show(
+            ui,
+            |ui| {
+                if switch_row(ui, "Keep on top", &mut self.keep_on_top).changed() {
+                    self.apply_window_level(ui.ctx());
                 }
-                if ui.small_button("Bust").clicked() {
-                    avatar.set_view(avatar::View::Bust);
+                if let Some(avatar) = &self.avatar {
+                    ui.add_space(4.0);
+                    egui::Grid::new("avatar_params")
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for param in &avatar.params {
+                                ui.label(egui::RichText::new(param).small());
+                                match avatar.values.iter().find(|(name, _)| name == param) {
+                                    Some((_, value)) => ui.label(
+                                        egui::RichText::new(format!(
+                                            "{:+.2} {:+.2}",
+                                            value.x, value.y
+                                        ))
+                                        .small()
+                                        .monospace(),
+                                    ),
+                                    None => ui
+                                        .label(egui::RichText::new("idle").small().color(TEXT_DIM)),
+                                };
+                                ui.end_row();
+                            }
+                        });
                 }
-                if ui.small_button("Full body").clicked() {
-                    avatar.set_view(avatar::View::FullBody);
-                }
-            });
-            ui.weak("Scroll or pinch to zoom toward the cursor, drag to move.");
-            ui.collapsing(format!("Parameters ({})", avatar.params.len()), |ui| {
-                egui::Grid::new("avatar_params")
-                    .striped(true)
-                    .show(ui, |ui| {
-                        for param in &avatar.params {
-                            ui.label(param);
-                            match avatar.values.iter().find(|(name, _)| name == param) {
-                                Some((_, value)) => {
-                                    ui.monospace(format!("{:+.2} {:+.2}", value.x, value.y))
-                                }
-                                None => ui.weak("not tracked"),
-                            };
-                            ui.end_row();
-                        }
-                    });
-            });
+            },
+        );
+
+        section(ui, "Support");
+        hint(
+            ui,
+            "Kamen is free. If it's useful to you, a donation helps keep it going.",
+        );
+        if ui
+            .add_sized([ui.available_width(), 28.0], egui::Button::new("Donate"))
+            .on_hover_text(DONATE_URL)
+            .clicked()
+        {
+            ui.ctx().open_url(egui::OpenUrl::new_tab(DONATE_URL));
+        }
+
+        ui.add_space(12.0);
+        if ui
+            .add_sized(
+                [ui.available_width(), 30.0],
+                egui::Button::new("Hide controls"),
+            )
+            .on_hover_text("Shows only the avatar. Press Esc to bring the controls back.")
+            .clicked()
+        {
+            self.avatar_only = true;
         }
     }
 
-    fn build_source(&self) -> Option<CameraSource> {
-        match self.source_mode {
-            SourceMode::Usb => self
-                .devices
-                .get(self.selected_device)
-                .cloned()
-                .map(CameraSource::Usb),
-            SourceMode::Rtsp => {
-                build_rtsp_source(&self.rtsp_url, &self.rtsp_username, &self.rtsp_password)
-            }
-        }
-    }
-
-    fn connect(&mut self) {
-        let Some(source) = self.build_source() else {
-            self.status = match self.source_mode {
-                SourceMode::Usb => "No camera selected".into(),
-                SourceMode::Rtsp => "RTSP URL is empty".into(),
-            };
+    /// Camera picture with the tracked landmarks, fitted to the sidebar.
+    fn camera_preview(&self, ui: &mut egui::Ui) {
+        let Some(texture) = self
+            .stream
+            .as_ref()
+            .and_then(|stream| stream.texture.as_ref())
+        else {
+            hint(ui, "Waiting for the camera…");
             return;
         };
-        self.status = format!("Connecting to {}...", source_label(&source));
-        match cameras::open_source(source.clone(), STREAM_CONFIG) {
-            Ok(camera) => {
-                let (tracker_tx, tracker_rx) = tracker::spawn_tracker();
-                self.stream = Some(spawn_stream(
-                    camera,
-                    tracker_tx,
-                    self.track_flag.clone(),
-                    self.preview_flag.clone(),
-                ));
-                self.active = true;
-                self.tracker_rx = Some(tracker_rx);
-                self.track_result = None;
-                self.status = format!("Streaming: {}", source_label(&source));
-                self.refresh_capabilities();
-            }
-            Err(error) => {
-                self.stream = None;
-                self.status = format!("Open failed: {error}");
-            }
-        }
-    }
-
-    fn disconnect(&mut self) {
-        self.stream = None;
-        self.tracker_rx = None;
-        self.track_result = None;
-        self.status = "Disconnected".into();
-    }
-
-    fn refresh_devices(&mut self) {
-        self.devices = cameras::devices().unwrap_or_default();
-        if self.selected_device >= self.devices.len() {
-            self.selected_device = 0;
-        }
-    }
-
-    fn snapshot(&mut self) {
-        let Some(stream) = &self.stream else {
+        let width = ui.available_width();
+        let size = egui::vec2(width, width / texture.aspect_ratio());
+        let image = egui::Image::new((texture.id(), size)).corner_radius(8);
+        let rect = ui.add(image).rect;
+        let Some(result) = &self.track_result else {
             return;
         };
-        let Some(frame) = capture_frame(&stream.pump) else {
-            self.last_capture = Some("Capture failed".into());
+        let Some(head) = &result.head else {
             return;
         };
-        let variance = analysis::blur_variance(&frame);
-        let path = format!("snapshot-{}.png", unix_timestamp());
-        match save_png(&frame, &path) {
-            Ok(()) => self.last_capture = Some(format!("Wrote {path} (sharpness {variance:.1})")),
-            Err(error) => self.last_capture = Some(format!("Save failed: {error}")),
-        }
-    }
-
-    fn reset_to_defaults(&mut self) {
-        let Some(device) = self.devices.get(self.selected_device) else {
-            return;
-        };
-        match cameras::reset_to_defaults(device) {
-            Ok(()) => {
-                self.current_controls = cameras::read_controls(device).unwrap_or_default();
-                self.pending_controls = Controls::default();
-                self.last_capture = Some("Controls reset to factory defaults".into());
-            }
-            Err(error) => {
-                self.last_capture = Some(format!("Reset failed: {error}"));
-            }
-        }
-    }
-
-    fn analyze_frame(&mut self) {
-        let Some(stream) = &self.stream else {
-            return;
-        };
-        let Some(frame) = capture_frame(&stream.pump) else {
-            self.last_capture = Some("Capture failed".into());
-            return;
-        };
-        let variance = analysis::blur_variance(&frame);
-        self.last_capture = Some(format!(
-            "Current frame sharpness: {variance:.1} (higher = sharper; calibrate per source)"
-        ));
-    }
-
-    fn pick_sharpest(&mut self) {
-        let Some(stream) = &self.stream else {
-            return;
-        };
-        let mut ring = analysis::ring_new(SHARPEST_BURST_SIZE);
-        for _ in 0..SHARPEST_BURST_SIZE {
-            if let Some(frame) = capture_frame(&stream.pump) {
-                analysis::ring_push(&mut ring, frame);
-            }
-            sleep(SHARPEST_BURST_INTERVAL);
-        }
-        let Some(sharpest) = analysis::take_sharpest(&ring) else {
-            self.last_capture = Some("Burst captured no frames".into());
-            return;
-        };
-        let variance = analysis::blur_variance(&sharpest);
-        let path = format!("sharpest-{}.png", unix_timestamp());
-        match save_png(&sharpest, &path) {
-            Ok(()) => {
-                self.last_capture = Some(format!(
-                    "Wrote {path} (sharpness {variance:.1}, best of {})",
-                    ring.frames.len()
-                ))
-            }
-            Err(error) => self.last_capture = Some(format!("Save failed: {error}")),
+        let scale = rect.width() / result.frame_w as f32;
+        let painter = ui.painter_at(rect);
+        for point in &head.points {
+            let position = rect.min + egui::vec2(point[0], point[1]) * scale;
+            painter.circle_filled(position, 1.2, ACCENT);
         }
     }
 }
 
 impl eframe::App for App {
-    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
-        if self.avatar_only && matches!(self.background, Background::Transparent) {
-            [0.0; 4]
-        } else {
-            visuals.panel_fill.to_normalized_gamma_f32()
-        }
-    }
-
     /// Runs every frame, also while the window is hidden (covered, or on
     /// another Space), when eframe skips `ui` and painting.
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
@@ -932,7 +694,6 @@ impl eframe::App for App {
         {
             self.camera_fps.tick();
         }
-        self.track_flag.store(self.track_enabled, Ordering::Relaxed);
         if let Some(rx) = &self.tracker_rx {
             while let Ok(result) = rx.try_recv() {
                 self.track_fps.tick();
@@ -940,19 +701,19 @@ impl eframe::App for App {
                 self.track_result = Some(result);
             }
         }
-        if !self.track_enabled {
-            self.track_result = None;
-        }
         self.face.advance();
 
         let hidden = ctx.input(|i| i.viewport().occluded == Some(true));
-        self.preview_flag
-            .store(!self.avatar_only && !hidden, Ordering::Relaxed);
-        if hidden && self.avatar_only {
+        self.preview_flag.store(
+            self.show_preview && !self.avatar_only && !hidden,
+            Ordering::Relaxed,
+        );
+        self.update_syphon();
+        if hidden && (self.avatar_only || self.syphon.is_some()) {
             if !self.presenting_hidden {
                 self.presenting_hidden = true;
                 self.hidden_log
-                    .note("hidden in Avatar only mode: drawing the avatar directly");
+                    .note("hidden: drawing the avatar directly (controls hidden, or Syphon)");
             }
             self.present_while_hidden(ctx, frame);
             // `ui` isn't running to ask for the next frame.
@@ -960,7 +721,7 @@ impl eframe::App for App {
         } else if hidden != self.presenting_hidden {
             self.presenting_hidden = hidden;
             self.hidden_log.note(if hidden {
-                "hidden, but not in Avatar only mode: nothing is drawn"
+                "hidden, with controls showing and Syphon off: nothing is drawn"
             } else {
                 "visible again"
             });
@@ -969,232 +730,83 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        if self.autofocus.is_some() {
-            self.tick_autofocus(&ctx);
+        if self.avatar_only && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.avatar_only = false;
         }
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
-        if let Some(session) = self.discovery.as_mut() {
-            poll_discovery(session);
-        }
-
-        if self.avatar_only {
-            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                self.avatar_only = false;
-            }
-            egui::CentralPanel::default()
-                .frame(egui::Frame::NONE)
-                .show_inside(ui, |ui| self.show_avatar(ui, frame));
-            ctx.request_repaint_after(self.frame_interval());
-            return;
-        }
-
-        egui::Panel::top("bar").show_inside(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("Kamen");
-                ui.separator();
-                ui.selectable_value(&mut self.source_mode, SourceMode::Usb, "USB");
-                ui.selectable_value(&mut self.source_mode, SourceMode::Rtsp, "RTSP");
-                ui.separator();
-                ui.checkbox(&mut self.track_enabled, "Face tracking");
-                #[cfg(any(target_os = "macos", target_os = "windows"))]
-                {
-                    ui.separator();
-                    ui.toggle_value(&mut self.discover_open, "Discover");
-                }
-            });
-
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
-            if self.discover_open {
-                self.render_discover(ui);
-            }
-
-            let mut selection_changed = false;
-            ui.horizontal(|ui| match self.source_mode {
-                SourceMode::Usb => {
-                    let labels: Vec<String> = if self.devices.is_empty() {
-                        vec!["No cameras".into()]
-                    } else {
-                        self.devices.iter().map(|d| d.name.clone()).collect()
-                    };
-                    egui::ComboBox::from_label("Camera")
-                        .selected_text(
-                            labels
-                                .get(self.selected_device)
-                                .cloned()
-                                .unwrap_or_else(|| "No cameras".into()),
-                        )
-                        .show_ui(ui, |ui| {
-                            for (index, label) in labels.iter().enumerate() {
-                                let previous = self.selected_device;
-                                let response =
-                                    ui.selectable_value(&mut self.selected_device, index, label);
-                                if response.clicked() && self.selected_device != previous {
-                                    selection_changed = true;
-                                }
-                            }
-                        });
-                    if ui.button("Refresh").clicked() {
-                        self.refresh_devices();
-                        selection_changed = true;
-                    }
-                }
-                SourceMode::Rtsp => {
-                    let _ = &mut selection_changed;
-                    ui.label("URL");
-                    ui.text_edit_singleline(&mut self.rtsp_url);
-                    ui.label("User");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.rtsp_username).desired_width(120.0),
-                    );
-                    ui.label("Pass");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.rtsp_password)
-                            .password(true)
-                            .desired_width(120.0),
-                    );
-                }
-            });
-
-            if selection_changed {
-                self.refresh_capabilities();
-            }
-
-            ui.horizontal(|ui| {
-                if ui.button("Connect").clicked() {
-                    self.connect();
-                }
-                if self.stream.is_some() && ui.button("Disconnect").clicked() {
-                    self.disconnect();
-                }
-                ui.separator();
-                ui.label(&self.status);
-                if self.stream.is_some() {
-                    ui.separator();
-                    ui.label(format!("camera {:.0} fps", self.camera_fps.fps));
-                    if self.track_enabled {
-                        let ms = self.track_result.as_ref().map_or(0.0, |r| r.ms);
-                        ui.label(format!(
-                            "tracking {:.0} fps ({ms:.1} ms)",
-                            self.track_fps.fps
-                        ));
-                    }
-                }
-                if let Some(last) = &self.last_capture {
-                    ui.separator();
-                    ui.label(last);
-                }
-            });
-        });
-
-        if self.stream.is_some() {
-            egui::Panel::bottom("actions").show_inside(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let preview_label = if self.active {
-                        "Preview: on"
-                    } else {
-                        "Preview: off"
-                    };
-                    if ui.button(preview_label).clicked() {
-                        self.active = !self.active;
-                        if let Some(stream) = &self.stream {
-                            set_active(&stream.pump, self.active);
-                        }
-                    }
-                    if ui.button("Take picture").clicked() {
-                        self.snapshot();
-                    }
-                    if ui.button("Analyze sharpness").clicked() {
-                        self.analyze_frame();
-                    }
-                    if ui
-                        .button(format!("Pick sharpest ({SHARPEST_BURST_SIZE}-frame burst)"))
-                        .clicked()
-                    {
-                        self.pick_sharpest();
-                    }
+        if !self.avatar_only {
+            egui::Panel::right("controls")
+                .resizable(false)
+                .exact_size(SIDEBAR_WIDTH)
+                .frame(egui::Frame::new().fill(SURFACE).inner_margin(16.0))
+                .show_inside(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| self.sidebar(ui));
                 });
-                ui.collapsing("Capabilities", |ui| {
-                    render_capabilities_panel(
-                        ui,
-                        self.capabilities.as_ref(),
-                        self.capabilities_error.as_deref(),
-                    );
-                });
-                let has_controls_ui = self.capabilities.is_some();
-                if has_controls_ui {
-                    ui.collapsing("Controls", |ui| {
-                        let changed = render_controls_editor(
-                            ui,
-                            self.capabilities.as_ref().unwrap(),
-                            &self.current_controls,
-                            &mut self.pending_controls,
-                        );
-                        if changed && self.live_apply {
-                            self.queue_apply();
-                        }
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut self.live_apply, "Apply live");
-                            if !self.live_apply && ui.button("Apply").clicked() {
-                                self.queue_apply();
-                            }
-                            if ui.button("Reset to defaults").clicked() {
-                                self.reset_to_defaults();
-                            }
-                            let has_focus = self
-                                .capabilities
-                                .as_ref()
-                                .and_then(|caps| caps.focus.as_ref())
-                                .is_some();
-                            if has_focus {
-                                let autofocus_label = match self.autofocus.as_ref() {
-                                    Some(state) => format!(
-                                        "Autofocusing {}/{}",
-                                        state.sample_index.min(state.total_samples),
-                                        state.total_samples
-                                    ),
-                                    None => "Autofocus (sweep)".to_string(),
-                                };
-                                let autofocus_button = egui::Button::new(autofocus_label);
-                                if ui
-                                    .add_enabled(self.autofocus.is_none(), autofocus_button)
-                                    .clicked()
-                                {
-                                    self.start_autofocus();
-                                }
-                            }
-                        });
-                    });
-                }
-            });
         }
-
-        egui::Panel::right("avatar")
-            .resizable(true)
-            .default_size(260.0)
-            .show_inside(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| self.avatar_panel(ui));
-            });
-
-        egui::CentralPanel::default().show_inside(ui, |ui| {
-            let (left, right) = ui
-                .available_rect_before_wrap()
-                .split_left_right_at_fraction(0.5);
-            ui.scope_builder(egui::UiBuilder::new().max_rect(left), |ui| {
-                self.show_camera(ui)
-            });
-            ui.scope_builder(egui::UiBuilder::new().max_rect(right), |ui| {
-                self.show_avatar(ui, frame)
-            });
-        });
-
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show_inside(ui, |ui| self.show_avatar(ui, frame));
         ctx.request_repaint_after(self.frame_interval());
     }
+}
+
+/// Small dim heading that starts a group of controls.
+fn section(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(14.0);
+    ui.label(
+        egui::RichText::new(title.to_uppercase())
+            .small()
+            .strong()
+            .color(TEXT_DIM),
+    );
+}
+
+fn hint(ui: &mut egui::Ui, text: &str) {
+    ui.label(egui::RichText::new(text).small().color(TEXT_DIM));
+}
+
+/// A label on the left and an on/off switch on the right.
+fn switch_row(ui: &mut egui::Ui, label: &str, on: &mut bool) -> egui::Response {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            switch(ui, on)
+        })
+        .inner
+    })
+    .inner
+}
+
+fn switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
+    let (rect, mut response) = ui.allocate_exact_size(egui::vec2(36.0, 20.0), egui::Sense::click());
+    if response.clicked() {
+        *on = !*on;
+        response.mark_changed();
+    }
+    let t = ui.ctx().animate_bool(response.id, *on);
+    let mix = |from: u8, to: u8| (from as f32 + (to as f32 - from as f32) * t).round() as u8;
+    let track = egui::Color32::from_rgb(
+        mix(CONTROL_HOVER.r(), ACCENT.r()),
+        mix(CONTROL_HOVER.g(), ACCENT.g()),
+        mix(CONTROL_HOVER.b(), ACCENT.b()),
+    );
+    let radius = rect.height() / 2.0;
+    ui.painter().rect_filled(rect, radius, track);
+    let knob_x = rect.left() + radius + (rect.width() - 2.0 * radius) * t;
+    ui.painter().circle_filled(
+        egui::pos2(knob_x, rect.center().y),
+        radius - 3.0,
+        egui::Color32::WHITE,
+    );
+    response
 }
 
 /// Camera pump plus the egui texture it feeds. Frames are converted to a
 /// `ColorImage` on the pump thread, so the UI thread only uploads them.
 struct CameraStream {
-    pump: Pump,
+    /// Keeps the camera running; dropping it stops the stream.
+    _pump: Pump,
     latest: Arc<Mutex<Option<egui::ColorImage>>>,
     texture: Option<egui::TextureHandle>,
 }
@@ -1218,7 +830,7 @@ fn spawn_stream(
         }
     });
     CameraStream {
-        pump,
+        _pump: pump,
         latest,
         texture: None,
     }
@@ -1238,8 +850,8 @@ fn frame_to_color_image(frame: &cameras::Frame) -> Option<egui::ColorImage> {
     if data.len() < stride * height.saturating_sub(1) + width * 4 {
         return None;
     }
-    // The preview is shown at about half the window width, so a full-HD frame
-    // is halved: a quarter of the pixels to convert and upload.
+    // The preview is small, so a full-HD frame is halved: a quarter of the
+    // pixels to convert and upload.
     let step = if width > PREVIEW_MAX_WIDTH { 2 } else { 1 };
     let (out_width, out_height) = (width / step, height / step);
     let mut pixels = Vec::with_capacity(out_width * out_height);
@@ -1276,41 +888,23 @@ fn update_texture(stream: &mut CameraStream, ctx: &egui::Context) -> bool {
     true
 }
 
-/// Draw the stream aspect-fit into the available space; returns the image rect.
-fn show_stream(stream: &CameraStream, ui: &mut egui::Ui) -> Option<egui::Rect> {
-    let texture = stream.texture.as_ref()?;
-    let aspect = texture.aspect_ratio();
-    let available = ui.available_size();
-    let width = available.x.min(available.y * aspect);
-    let size = egui::vec2(width, width / aspect);
-    Some(ui.image((texture.id(), size)).rect)
-}
-
-/// Avatar loaded at startup, relative to the project folder or to
-/// `Contents/Resources` in the macOS app bundle.
-const DEFAULT_AVATAR: &str = "models/vrm/doruk.vrm";
-
 /// The default avatar's location, if the file exists: inside the app bundle
 /// first (an app opened from Finder runs with `/` as working directory), then
 /// relative to the working directory.
 fn default_avatar_path() -> Option<std::path::PathBuf> {
-    let bundled = std::env::current_exe()
-        .ok()
-        .and_then(|exe| Some(exe.parent()?.parent()?.join("Resources").join(DEFAULT_AVATAR)));
+    let bundled = std::env::current_exe().ok().and_then(|exe| {
+        Some(
+            exe.parent()?
+                .parent()?
+                .join("Resources")
+                .join(DEFAULT_AVATAR),
+        )
+    });
     bundled
         .into_iter()
         .chain([std::path::PathBuf::from(DEFAULT_AVATAR)])
         .find(|path| path.exists())
 }
-
-/// Time between drawn frames. Buffer swaps don't wait for the display
-/// (`vsync: false`), so this is what paces the app.
-const FRAME_INTERVAL: Duration = Duration::from_millis(16);
-const LOW_FPS_FRAME_INTERVAL: Duration = Duration::from_millis(33);
-/// Camera frames wider than this are halved for the preview.
-const PREVIEW_MAX_WIDTH: usize = 1280;
-/// Longest side of the avatar render, in pixels.
-const AVATAR_MAX_RENDER_SIDE: f32 = 1600.0;
 
 /// Diagnostic for the hidden-window path: once a second while the window is
 /// hidden, appends how many frames were drawn to `kamen-hidden.log` in the
@@ -1363,7 +957,6 @@ impl HiddenLog {
 enum Background {
     Color(egui::Color32),
     Image,
-    Transparent,
 }
 
 /// Rect that covers `area` with an image of `size`, keeping its aspect ratio.
@@ -1393,470 +986,9 @@ impl FpsCounter {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-fn build_rtsp_source(url: &str, username: &str, password: &str) -> Option<CameraSource> {
-    let url = url.trim();
-    if url.is_empty() {
-        return None;
-    }
-    let username = username.trim();
-    let credentials = if username.is_empty() && password.is_empty() {
-        None
-    } else {
-        Some(Credentials {
-            username: username.to_string(),
-            password: password.to_string(),
-        })
-    };
-    Some(CameraSource::Rtsp {
-        url: url.to_string(),
-        credentials,
-    })
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn build_rtsp_source(_url: &str, _username: &str, _password: &str) -> Option<CameraSource> {
-    None
-}
-
-fn source_label(source: &CameraSource) -> String {
-    match source {
-        CameraSource::Usb(device) => device.name.clone(),
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
-        CameraSource::Rtsp { url, .. } => url.clone(),
-    }
-}
-
-fn save_png(frame: &cameras::Frame, path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let rgba = cameras::to_rgba8(frame)?;
-    let file = std::fs::File::create(path)?;
-    let encoder = PngEncoder::new(std::io::BufWriter::new(file));
-    encoder.write_image(&rgba, frame.width, frame.height, ExtendedColorType::Rgba8)?;
-    Ok(())
-}
-
-const SUPPORTED_MARK: &str = "✓";
-const UNSUPPORTED_MARK: &str = "×";
-
-fn render_capabilities_panel(
-    ui: &mut egui::Ui,
-    capabilities: Option<&ControlCapabilities>,
-    error: Option<&str>,
-) {
-    if let Some(message) = error {
-        ui.colored_label(egui::Color32::from_rgb(200, 80, 80), message);
-        return;
-    }
-    let Some(caps) = capabilities else {
-        ui.label("Connect to a USB camera to view its control capabilities.");
-        return;
-    };
-    let rows: [(ControlKind, CapabilityDisplay); 16] = [
-        (
-            ControlKind::Focus,
-            CapabilityDisplay::Range(caps.focus.as_ref()),
-        ),
-        (
-            ControlKind::AutoFocus,
-            CapabilityDisplay::Bool(caps.auto_focus),
-        ),
-        (
-            ControlKind::Exposure,
-            CapabilityDisplay::Range(caps.exposure.as_ref()),
-        ),
-        (
-            ControlKind::AutoExposure,
-            CapabilityDisplay::Bool(caps.auto_exposure),
-        ),
-        (
-            ControlKind::WhiteBalanceTemperature,
-            CapabilityDisplay::Range(caps.white_balance_temperature.as_ref()),
-        ),
-        (
-            ControlKind::AutoWhiteBalance,
-            CapabilityDisplay::Bool(caps.auto_white_balance),
-        ),
-        (
-            ControlKind::Brightness,
-            CapabilityDisplay::Range(caps.brightness.as_ref()),
-        ),
-        (
-            ControlKind::Contrast,
-            CapabilityDisplay::Range(caps.contrast.as_ref()),
-        ),
-        (
-            ControlKind::Saturation,
-            CapabilityDisplay::Range(caps.saturation.as_ref()),
-        ),
-        (
-            ControlKind::Sharpness,
-            CapabilityDisplay::Range(caps.sharpness.as_ref()),
-        ),
-        (
-            ControlKind::Gain,
-            CapabilityDisplay::Range(caps.gain.as_ref()),
-        ),
-        (
-            ControlKind::BacklightCompensation,
-            CapabilityDisplay::Range(caps.backlight_compensation.as_ref()),
-        ),
-        (
-            ControlKind::PowerLineFrequency,
-            CapabilityDisplay::PowerLine(caps.power_line_frequency.is_some()),
-        ),
-        (
-            ControlKind::Pan,
-            CapabilityDisplay::Range(caps.pan.as_ref()),
-        ),
-        (
-            ControlKind::Tilt,
-            CapabilityDisplay::Range(caps.tilt.as_ref()),
-        ),
-        (
-            ControlKind::Zoom,
-            CapabilityDisplay::Range(caps.zoom.as_ref()),
-        ),
-    ];
-    egui::Grid::new("capabilities_grid")
-        .num_columns(3)
-        .spacing([10.0, 4.0])
-        .show(ui, |ui| {
-            for (key, display) in rows {
-                render_capability_row(ui, key, display);
-                ui.end_row();
-            }
-        });
-}
-
-enum CapabilityDisplay<'a> {
-    Range(Option<&'a ControlRange>),
-    Bool(Option<bool>),
-    PowerLine(bool),
-}
-
-fn render_capability_row(ui: &mut egui::Ui, key: ControlKind, display: CapabilityDisplay) {
-    let green = egui::Color32::from_rgb(80, 200, 120);
-    let red = egui::Color32::from_rgb(200, 80, 80);
-    let (supported, detail) = match display {
-        CapabilityDisplay::Range(Some(range)) => (true, format_range(range)),
-        CapabilityDisplay::Range(None) => (false, "not supported".to_string()),
-        CapabilityDisplay::Bool(Some(true)) => (true, "auto toggle supported".to_string()),
-        CapabilityDisplay::Bool(Some(false)) => (true, "manual only".to_string()),
-        CapabilityDisplay::Bool(None) => (false, "not supported".to_string()),
-        CapabilityDisplay::PowerLine(true) => (true, "menu supported".to_string()),
-        CapabilityDisplay::PowerLine(false) => (false, "not supported".to_string()),
-    };
-    let mark = if supported {
-        SUPPORTED_MARK
-    } else {
-        UNSUPPORTED_MARK
-    };
-    let mark_color = if supported { green } else { red };
-    let caveat = if supported { None } else { key.caveat() };
-    let mark_response = ui.colored_label(mark_color, mark);
-    let name_response = ui.label(key.label());
-    let detail_response = ui.label(detail);
-    if let Some(caveat) = caveat {
-        mark_response.on_hover_text(caveat);
-        name_response.on_hover_text(caveat);
-        detail_response.on_hover_text(caveat);
-    }
-}
-
-fn auto_lock_hover(paired_label: &str) -> String {
-    format!(
-        "Disabled because {paired_label} is set to 'auto'. Change {paired_label} to 'leave' or \
-         'manual' to enable this slider."
-    )
-}
-
-fn render_controls_editor(
-    ui: &mut egui::Ui,
-    capabilities: &ControlCapabilities,
-    current: &Controls,
-    pending: &mut Controls,
-) -> bool {
-    let mut changed = false;
-    egui::Grid::new("controls_editor_grid")
-        .num_columns(2)
-        .spacing([12.0, 6.0])
-        .show(ui, |ui| {
-            changed |= numeric_slider_row(
-                ui,
-                ControlKind::Focus,
-                capabilities.focus.as_ref(),
-                current.focus,
-                pending.auto_focus == Some(true),
-                Some(ControlKind::AutoFocus),
-                &mut pending.focus,
-            );
-            changed |= auto_tri_state_row(
-                ui,
-                ControlKind::AutoFocus,
-                capabilities.auto_focus,
-                &mut pending.auto_focus,
-            );
-            changed |= numeric_slider_row(
-                ui,
-                ControlKind::Exposure,
-                capabilities.exposure.as_ref(),
-                current.exposure,
-                pending.auto_exposure == Some(true),
-                Some(ControlKind::AutoExposure),
-                &mut pending.exposure,
-            );
-            changed |= auto_tri_state_row(
-                ui,
-                ControlKind::AutoExposure,
-                capabilities.auto_exposure,
-                &mut pending.auto_exposure,
-            );
-            changed |= numeric_slider_row(
-                ui,
-                ControlKind::WhiteBalanceTemperature,
-                capabilities.white_balance_temperature.as_ref(),
-                current.white_balance_temperature,
-                pending.auto_white_balance == Some(true),
-                Some(ControlKind::AutoWhiteBalance),
-                &mut pending.white_balance_temperature,
-            );
-            changed |= auto_tri_state_row(
-                ui,
-                ControlKind::AutoWhiteBalance,
-                capabilities.auto_white_balance,
-                &mut pending.auto_white_balance,
-            );
-            changed |= numeric_slider_row(
-                ui,
-                ControlKind::Brightness,
-                capabilities.brightness.as_ref(),
-                current.brightness,
-                false,
-                None,
-                &mut pending.brightness,
-            );
-            changed |= numeric_slider_row(
-                ui,
-                ControlKind::Contrast,
-                capabilities.contrast.as_ref(),
-                current.contrast,
-                false,
-                None,
-                &mut pending.contrast,
-            );
-            changed |= numeric_slider_row(
-                ui,
-                ControlKind::Saturation,
-                capabilities.saturation.as_ref(),
-                current.saturation,
-                false,
-                None,
-                &mut pending.saturation,
-            );
-            changed |= numeric_slider_row(
-                ui,
-                ControlKind::Sharpness,
-                capabilities.sharpness.as_ref(),
-                current.sharpness,
-                false,
-                None,
-                &mut pending.sharpness,
-            );
-            changed |= numeric_slider_row(
-                ui,
-                ControlKind::Gain,
-                capabilities.gain.as_ref(),
-                current.gain,
-                false,
-                None,
-                &mut pending.gain,
-            );
-            changed |= numeric_slider_row(
-                ui,
-                ControlKind::BacklightCompensation,
-                capabilities.backlight_compensation.as_ref(),
-                current.backlight_compensation,
-                false,
-                None,
-                &mut pending.backlight_compensation,
-            );
-            changed |= numeric_slider_row(
-                ui,
-                ControlKind::Pan,
-                capabilities.pan.as_ref(),
-                current.pan,
-                false,
-                None,
-                &mut pending.pan,
-            );
-            changed |= numeric_slider_row(
-                ui,
-                ControlKind::Tilt,
-                capabilities.tilt.as_ref(),
-                current.tilt,
-                false,
-                None,
-                &mut pending.tilt,
-            );
-            changed |= numeric_slider_row(
-                ui,
-                ControlKind::Zoom,
-                capabilities.zoom.as_ref(),
-                current.zoom,
-                false,
-                None,
-                &mut pending.zoom,
-            );
-        });
-    changed
-}
-
-fn numeric_slider_row(
-    ui: &mut egui::Ui,
-    key: ControlKind,
-    range: Option<&ControlRange>,
-    current: Option<f32>,
-    locked_by_auto: bool,
-    paired_auto: Option<ControlKind>,
-    pending: &mut Option<f32>,
-) -> bool {
-    let mut changed = false;
-    ui.label(key.label());
-    match range {
-        Some(range) => {
-            let fallback_value = current.unwrap_or(range.default);
-            ui.horizontal(|ui| {
-                let lock_hover = if locked_by_auto {
-                    paired_auto.map(|auto| auto_lock_hover(auto.label()))
-                } else {
-                    None
-                };
-                let mut enabled = pending.is_some();
-                let checkbox_enabled = !locked_by_auto;
-                let checkbox_response =
-                    ui.add_enabled(checkbox_enabled, egui::Checkbox::new(&mut enabled, ""));
-                if checkbox_response.changed() {
-                    *pending = if enabled { Some(fallback_value) } else { None };
-                    changed = true;
-                }
-                if let Some(hover) = lock_hover.as_deref() {
-                    checkbox_response.on_hover_text(hover);
-                }
-                let slider_enabled = enabled && !locked_by_auto;
-                let mut value = pending.unwrap_or(fallback_value);
-                let slider_response = ui.add_enabled(
-                    slider_enabled,
-                    egui::Slider::new(&mut value, range.min..=range.max),
-                );
-                if slider_response.changed() {
-                    *pending = Some(value);
-                    changed = true;
-                }
-                if let Some(hover) = lock_hover.as_deref() {
-                    slider_response.on_hover_text(hover);
-                }
-                if locked_by_auto {
-                    ui.weak("auto on");
-                } else if let Some(current_value) = current {
-                    ui.weak(format!("now {current_value:.2}"));
-                }
-            });
-        }
-        None => {
-            let response = ui.weak("not supported");
-            if let Some(caveat) = key.caveat() {
-                response.on_hover_text(caveat);
-            }
-        }
-    }
-    ui.end_row();
-    changed
-}
-
-fn auto_tri_state_row(
-    ui: &mut egui::Ui,
-    key: ControlKind,
-    capability: Option<bool>,
-    pending: &mut Option<bool>,
-) -> bool {
-    ui.label(key.label());
-    if capability != Some(true) {
-        let response = ui.weak("not supported");
-        if let Some(caveat) = key.caveat() {
-            response.on_hover_text(caveat);
-        }
-        ui.end_row();
-        return false;
-    }
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        changed |= ui.radio_value(pending, None, "leave").changed();
-        changed |= ui.radio_value(pending, Some(false), "manual").changed();
-        changed |= ui.radio_value(pending, Some(true), "auto").changed();
-    });
-    ui.end_row();
-    changed
-}
-
-fn spawn_apply_worker() -> mpsc::Sender<ApplyRequest> {
-    let (tx, rx) = mpsc::channel::<ApplyRequest>();
-    std::thread::Builder::new()
-        .name("egui-demo-controls".into())
-        .spawn(move || worker_loop(rx))
-        .expect("spawn controls worker");
-    tx
-}
-
-fn worker_loop(rx: mpsc::Receiver<ApplyRequest>) {
-    while let Ok(mut latest) = rx.recv() {
-        while let Ok(newer) = rx.try_recv() {
-            latest = newer;
-        }
-        let (device, controls) = latest;
-        let _ = cameras::apply_controls(&device, &controls);
-    }
-}
-
-fn format_range(range: &ControlRange) -> String {
-    if range.step > 0.0 {
-        format!(
-            "{:.0}..{:.0} (step {:.0}, default {:.0})",
-            range.min, range.max, range.step, range.default
-        )
-    } else {
-        format!(
-            "{:.2}..{:.2} (default {:.2})",
-            range.min, range.max, range.default
-        )
-    }
-}
-
 fn unix_timestamp() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-fn parse_targets(input: &str) -> Result<(Vec<ipnet::IpNet>, Vec<std::net::SocketAddr>), String> {
-    let mut subnets = Vec::new();
-    let mut endpoints = Vec::new();
-    for raw in input.split(',') {
-        let token = raw.trim();
-        if token.is_empty() {
-            continue;
-        }
-        if let Ok(endpoint) = token.parse::<std::net::SocketAddr>() {
-            endpoints.push(endpoint);
-        } else if let Ok(net) = token.parse::<ipnet::IpNet>() {
-            subnets.push(net);
-        } else {
-            return Err(format!("could not parse `{token}` as CIDR or host:port"));
-        }
-    }
-    if subnets.is_empty() && endpoints.is_empty() {
-        return Err("enter at least one CIDR or host:port".into());
-    }
-    Ok((subnets, endpoints))
 }

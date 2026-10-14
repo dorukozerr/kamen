@@ -63,6 +63,7 @@ const SAME_HEAD_IOU: f32 = 0.4;
 const FOLLOW_DEAD_ZONE: f32 = 0.015;
 
 pub struct HeadTrack {
+    #[allow(dead_code)]
     pub rect: [f32; 4],
     pub points: Vec<[f32; 2]>,
     #[allow(dead_code)]
@@ -73,8 +74,10 @@ pub struct HeadTrack {
 
 pub struct TrackResult {
     pub frame_w: u32,
+    #[allow(dead_code)]
     pub frame_h: u32,
     pub head: Option<HeadTrack>,
+    #[allow(dead_code)]
     pub ms: f32,
 }
 

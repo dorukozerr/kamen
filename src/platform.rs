@@ -25,6 +25,126 @@ pub fn present_gl_frame() -> bool {
     false
 }
 
+/// A Syphon server: publishes frames to other apps on this Mac (OBS's
+/// "Syphon Client" source) through shared GPU memory, with transparency and
+/// without capturing a window.
+///
+/// Syphon is loaded at run time from `libSyphon.dylib`, built by
+/// `scripts/build-syphon.sh`; without that file `new` returns an error and
+/// the rest of the app is unaffected.
+#[cfg(target_os = "macos")]
+pub struct SyphonServer {
+    server: objc::Id,
+}
+
+#[cfg(target_os = "macos")]
+impl SyphonServer {
+    /// Create a server named `name` on the current OpenGL context. Call with
+    /// the context current, and publish from that same context.
+    pub fn new(name: &std::ffi::CStr) -> Result<Self, String> {
+        const RTLD_NOW: std::ffi::c_int = 2;
+        unsafe extern "C" {
+            fn dlopen(path: *const std::ffi::c_char, mode: std::ffi::c_int) -> *mut std::ffi::c_void;
+        }
+        // In the app bundle, then where the build script leaves it.
+        let bundled = std::env::current_exe()
+            .ok()
+            .and_then(|exe| Some(exe.parent()?.parent()?.join("Frameworks/libSyphon.dylib")));
+        let loaded = bundled
+            .into_iter()
+            .chain([std::path::PathBuf::from("target/syphon/libSyphon.dylib")])
+            .filter_map(|path| std::ffi::CString::new(path.into_os_string().into_encoded_bytes()).ok())
+            // SAFETY: `dlopen` takes a NUL-terminated path and returns null on failure.
+            .any(|path| unsafe { !dlopen(path.as_ptr(), RTLD_NOW).is_null() });
+        if !loaded {
+            return Err("Syphon library not found. Run scripts/build-syphon.sh, then rebuild the app.".into());
+        }
+        // SAFETY: each message is sent with the signature of the method it
+        // names. `-CGLContextObj` returns the context pointer that
+        // `-initWithName:context:options:` expects; `options` may be nil.
+        unsafe {
+            let (Some(server_class), Some(context_class), Some(string_class)) = (
+                objc::class(c"SyphonOpenGLServer"),
+                objc::class(c"NSOpenGLContext"),
+                objc::class(c"NSString"),
+            ) else {
+                return Err("Syphon library is missing its server class".into());
+            };
+            let context = objc::send_id(context_class, objc::selector(c"currentContext"));
+            if context.is_null() {
+                return Err("no OpenGL context is current".into());
+            }
+            let cgl_context = objc::send_id(context, objc::selector(c"CGLContextObj"));
+            let name = objc::send_cstr(string_class, objc::selector(c"stringWithUTF8String:"), name.as_ptr());
+            let server = objc::send_init_server(
+                objc::send_id(server_class, objc::selector(c"alloc")),
+                objc::selector(c"initWithName:context:options:"),
+                name,
+                cgl_context,
+                std::ptr::null_mut(),
+            );
+            if server.is_null() {
+                return Err("Syphon could not start a server".into());
+            }
+            Ok(Self { server })
+        }
+    }
+
+    /// Publish an OpenGL 2D texture of `size` pixels (bottom row first, as
+    /// OpenGL renders). The caller sets the viewport to `size`, selects
+    /// texture unit 0 and disables blending first; Syphon leaves the default
+    /// framebuffer bound.
+    pub fn publish(&self, texture: u32, size: [u32; 2]) {
+        const GL_TEXTURE_2D: u32 = 0x0DE1;
+        let dimensions = objc::Size {
+            width: size[0] as f64,
+            height: size[1] as f64,
+        };
+        let region = objc::Rect {
+            x: 0.0,
+            y: 0.0,
+            size: dimensions,
+        };
+        // SAFETY: matches `-publishFrameTexture:textureTarget:imageRegion:
+        // textureDimensions:flipped:` (GLuint, GLenum, NSRect, NSSize, BOOL).
+        unsafe {
+            objc::send_publish(
+                self.server,
+                objc::selector(c"publishFrameTexture:textureTarget:imageRegion:textureDimensions:flipped:"),
+                texture,
+                GL_TEXTURE_2D,
+                region,
+                dimensions,
+                false,
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for SyphonServer {
+    fn drop(&mut self) {
+        // SAFETY: `-stop` and `-release` take no arguments and return nothing;
+        // `server` came from alloc/init and is released exactly once.
+        unsafe {
+            objc::send_void(self.server, objc::selector(c"stop"));
+            objc::send_void(self.server, objc::selector(c"release"));
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub struct SyphonServer;
+
+#[cfg(not(target_os = "macos"))]
+impl SyphonServer {
+    pub fn new(_name: &std::ffi::CStr) -> Result<Self, String> {
+        Err("Syphon is only available on macOS".into())
+    }
+
+    pub fn publish(&self, _texture: u32, _size: [u32; 2]) {}
+}
+
 /// Tell macOS this app is doing user-visible work for its whole lifetime.
 /// Otherwise App Nap throttles its timers once its windows are covered or on
 /// another Space, which stalls the avatar that OBS is capturing.
@@ -105,6 +225,43 @@ mod objc {
         let send: unsafe extern "C" fn(Id, Id, *const c_char) -> Id =
             unsafe { std::mem::transmute(objc_msgSend as unsafe extern "C" fn()) };
         unsafe { send(receiver, selector, text) }
+    }
+
+    /// `NSSize` and `NSRect` on 64-bit macOS.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Size {
+        pub width: f64,
+        pub height: f64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Rect {
+        pub x: f64,
+        pub y: f64,
+        pub size: Size,
+    }
+
+    pub unsafe fn send_init_server(receiver: Id, selector: Id, name: Id, context: Id, options: Id) -> Id {
+        let send: unsafe extern "C" fn(Id, Id, Id, Id, Id) -> Id =
+            unsafe { std::mem::transmute(objc_msgSend as unsafe extern "C" fn()) };
+        unsafe { send(receiver, selector, name, context, options) }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn send_publish(
+        receiver: Id,
+        selector: Id,
+        texture: u32,
+        target: u32,
+        region: Rect,
+        dimensions: Size,
+        flipped: bool,
+    ) {
+        let send: unsafe extern "C" fn(Id, Id, u32, u32, Rect, Size, bool) =
+            unsafe { std::mem::transmute(objc_msgSend as unsafe extern "C" fn()) };
+        unsafe { send(receiver, selector, texture, target, region, dimensions, flipped) }
     }
 
     pub unsafe fn send_activity(receiver: Id, selector: Id, options: u64, reason: Id) -> Id {
