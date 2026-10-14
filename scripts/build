@@ -1,15 +1,15 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Build Kamen for macOS.
 #
-#   scripts/build.sh          Build target/Kamen.app (same as `app`).
-#   scripts/build.sh dmg      Build the app, then target/Kamen-<version>.dmg.
-#   scripts/build.sh syphon   Rebuild the Syphon library.
-#   scripts/build.sh models   Re-convert the MediaPipe models from Google's.
+#   scripts/build          Build target/Kamen.app (same as `app`).
+#   scripts/build dmg      Build the app, then target/Kamen-<version>.dmg.
+#   scripts/build syphon   Rebuild the Syphon library.
+#   scripts/build models   Re-convert the MediaPipe models from Google's.
 #
 # `app` and `dmg` are the everyday ones. The other two only matter when
 # their inputs change: `app` builds Syphon itself the first time, and the
 # models are committed.
-set -eu
+set -euo pipefail
 cd "$(dirname "$0")/.."
 
 APP=target/Kamen.app

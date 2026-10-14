@@ -1097,16 +1097,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "egui-cameras"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4851cc7479e261e3402183b158bd55320c3d20a35eee17c130af14cb11da9140"
-dependencies = [
- "cameras",
- "egui",
-]
-
-[[package]]
 name = "egui-wgpu"
 version = "0.34.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2069,8 +2059,6 @@ version = "0.1.0"
 dependencies = [
  "cameras",
  "eframe",
- "egui",
- "egui-cameras",
  "glam",
  "glow",
  "gltf",

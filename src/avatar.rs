@@ -7,6 +7,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use eframe::egui;
 use glam::Vec2;
 use glow::HasContext;
 

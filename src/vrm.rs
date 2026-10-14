@@ -850,6 +850,7 @@ impl VrmAvatar {
     /// Pose from `face` and draw into `target`. `center` is the world point at
     /// the middle of the view and `view_height` the world height it shows.
     /// `clear` is the (premultiplied) color behind the avatar.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &mut self,
         gl: &glow::Context,

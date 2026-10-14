@@ -9,8 +9,6 @@ license = "WTFPL"
 [dependencies]
 cameras = "0.3.2"
 eframe = { version = "0.34", features = ["glow"] }
-egui = "0.34.3"
-egui-cameras = "0.3.2"
 glam = "0.29"
 glow = "0.17"
 gltf = { version = "1.4.1", default-features = false, features = ["utils", "names"] }

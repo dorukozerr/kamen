@@ -220,7 +220,7 @@ struct Roi {
 
 impl Roi {
     /// Frame position of a point given in crop coordinates (0..1 across it).
-    fn to_frame(&self, u: f32, v: f32) -> [f32; 2] {
+    fn to_frame(self, u: f32, v: f32) -> [f32; 2] {
         let (sin, cos) = self.angle.sin_cos();
         let (u, v) = ((u - 0.5) * self.size, (v - 0.5) * self.size);
         [self.cx + u * cos - v * sin, self.cy + u * sin + v * cos]
@@ -626,13 +626,10 @@ fn body_loop(
                 .map(body_roi_from_face);
         }
         let pose = pose_roi.and_then(|roi| pose_landmarks(&mut models.pose, &pixels, roi));
-        pose_roi = match &pose {
-            Some((_, next)) => Some(match pose_roi {
-                Some(current) if current.close_to(next) => current,
-                _ => *next,
-            }),
-            None => None,
-        };
+        pose_roi = pose.as_ref().map(|(_, next)| match pose_roi {
+            Some(current) if current.close_to(next) => current,
+            _ => *next,
+        });
         let pose = pose.map(|(pose, _)| pose);
 
         let mut hands: [Option<HandTrack>; 2] = [None, None];

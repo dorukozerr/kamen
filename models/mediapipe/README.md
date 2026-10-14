@@ -17,4 +17,4 @@ Sources, from `https://storage.googleapis.com/mediapipe-models/`:
 
 Not included: the pose detector (its sparse weights can't be converted with tf2onnx; Kamen places the body crop from the face) and the palm detector (hands are found from the pose's wrists, as in MediaPipe Holistic).
 
-`scripts/build.sh models` downloads the bundles and repeats the conversion. Verify the files here with `shasum -a 256 -c SHA256SUMS`.
+`scripts/build models` downloads the bundles and repeats the conversion. Verify the files here with `shasum -a 256 -c SHA256SUMS`.

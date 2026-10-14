@@ -66,6 +66,7 @@ pub struct BodyState {
     pub arms: [ArmState; 2],
 }
 
+#[derive(Default)]
 pub struct BodySolver {
     target: BodyState,
     last_seen: Option<Instant>,
@@ -76,17 +77,6 @@ pub struct BodySolver {
     pub state: BodyState,
 }
 
-impl Default for BodySolver {
-    fn default() -> Self {
-        Self {
-            target: BodyState::default(),
-            last_seen: None,
-            last_advance: None,
-            mirror: false,
-            state: BodyState::default(),
-        }
-    }
-}
 
 impl BodySolver {
     /// Feed one body result. Call for every result from the body tracker.

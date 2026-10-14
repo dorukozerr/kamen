@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use cameras::{Camera, CameraSource, Device, PixelFormat, Resolution, StreamConfig};
 use eframe::egui;
-use egui_cameras::Pump;
+use cameras::pump::Pump;
 
 const STREAM_CONFIG: StreamConfig = StreamConfig {
     resolution: Resolution {
@@ -960,7 +960,11 @@ fn spawn_stream(
 
 fn frame_to_color_image(frame: &cameras::Frame) -> Option<egui::ColorImage> {
     if frame.pixel_format != PixelFormat::Bgra8 {
-        return egui_cameras::frame_to_color_image(frame).ok();
+        let rgba = cameras::to_rgba8(frame).ok()?;
+        return Some(egui::ColorImage::from_rgba_unmultiplied(
+            [frame.width as usize, frame.height as usize],
+            &rgba,
+        ));
     }
     let (width, height) = (frame.width as usize, frame.height as usize);
     let stride = if frame.stride == 0 {
