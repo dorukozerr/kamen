@@ -1,4 +1,4 @@
-// Draws Kamen's app icon (a mask on a purple tile) and writes a 1024 px PNG.
+// Draws Kamen's app icon (a white mask on a black tile) and writes a 1024 px PNG.
 // Run through scripts/make-icon.sh, which turns it into assets/AppIcon.icns.
 import AppKit
 
@@ -12,8 +12,8 @@ NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: bitmap)
 let tile = NSRect(x: 100, y: 100, width: 824, height: 824)
 let tilePath = NSBezierPath(roundedRect: tile, xRadius: 186, yRadius: 186)
 NSGradient(
-    starting: NSColor(srgbRed: 0.56, green: 0.49, blue: 1.0, alpha: 1),
-    ending: NSColor(srgbRed: 0.27, green: 0.20, blue: 0.62, alpha: 1))!
+    starting: NSColor(srgbRed: 0.16, green: 0.16, blue: 0.18, alpha: 1),
+    ending: NSColor(srgbRed: 0.03, green: 0.03, blue: 0.04, alpha: 1))!
     .draw(in: tilePath, angle: -90)
 
 // The mask: wide at the brow, narrowing to the chin.
@@ -25,17 +25,17 @@ mask.curve(to: NSPoint(x: 254, y: 600), controlPoint1: NSPoint(x: 384, y: 250), 
 mask.curve(to: NSPoint(x: 512, y: 780), controlPoint1: NSPoint(x: 254, y: 720), controlPoint2: NSPoint(x: 364, y: 780))
 mask.close()
 let shadow = NSShadow()
-shadow.shadowColor = NSColor(white: 0, alpha: 0.28)
+shadow.shadowColor = NSColor(white: 0, alpha: 0.5)
 shadow.shadowBlurRadius = 36
 shadow.shadowOffset = NSSize(width: 0, height: -16)
 NSGraphicsContext.saveGraphicsState()
 shadow.set()
-NSColor(srgbRed: 0.97, green: 0.97, blue: 1.0, alpha: 1).setFill()
+NSColor(white: 0.97, alpha: 1).setFill()
 mask.fill()
 NSGraphicsContext.restoreGraphicsState()
 
 // Almond eyes, tilted up at the outer corners.
-let eyeColor = NSColor(srgbRed: 0.20, green: 0.15, blue: 0.45, alpha: 1)
+let eyeColor = NSColor(srgbRed: 0.05, green: 0.05, blue: 0.06, alpha: 1)
 for direction in [-1.0, 1.0] {
     let eye = NSBezierPath()
     eye.move(to: NSPoint(x: -72, y: 0))
