@@ -1,7 +1,9 @@
-//! Stage 3: turn 68 landmarks into avatar-ready expression values (`FaceState`).
+//! Stage 3: turn a tracked face into avatar-ready values (`FaceState`).
 //!
-//! Everything is measured relative to a neutral pose captured during
-//! calibration, so it works for different faces and camera angles.
+//! Head angles come from the 3D landmarks, expressions and gaze from the 52
+//! blendshape values. Everything is measured relative to a neutral pose
+//! captured during calibration, so it works for different faces and camera
+//! angles.
 //!
 //! Tracking results arrive at camera rate (20-30 fps) and set a target;
 //! `advance` eases the presented state toward it on every drawn frame, so the
@@ -9,9 +11,47 @@
 
 use std::time::{Duration, Instant};
 
-use glam::{Mat4, Vec3, Vec4};
+use glam::Vec3;
 
-use crate::tracker::TrackResult;
+use crate::tracker::{BLENDSHAPE_COUNT, FaceTrack, TrackResult};
+
+/// Positions of the blendshapes used here in MediaPipe's output. "Left" and
+/// "right" are the tracked person's own, so "left" is on the image's right.
+mod shape {
+    pub const BROW_DOWN_LEFT: usize = 1;
+    pub const BROW_DOWN_RIGHT: usize = 2;
+    pub const BROW_INNER_UP: usize = 3;
+    pub const BROW_OUTER_UP_LEFT: usize = 4;
+    pub const BROW_OUTER_UP_RIGHT: usize = 5;
+    pub const EYE_BLINK_LEFT: usize = 9;
+    pub const EYE_BLINK_RIGHT: usize = 10;
+    pub const EYE_LOOK_DOWN_LEFT: usize = 11;
+    pub const EYE_LOOK_DOWN_RIGHT: usize = 12;
+    pub const EYE_LOOK_IN_LEFT: usize = 13;
+    pub const EYE_LOOK_IN_RIGHT: usize = 14;
+    pub const EYE_LOOK_OUT_LEFT: usize = 15;
+    pub const EYE_LOOK_OUT_RIGHT: usize = 16;
+    pub const EYE_LOOK_UP_LEFT: usize = 17;
+    pub const EYE_LOOK_UP_RIGHT: usize = 18;
+    pub const EYE_SQUINT_LEFT: usize = 19;
+    pub const EYE_SQUINT_RIGHT: usize = 20;
+    pub const JAW_OPEN: usize = 25;
+    pub const MOUTH_FROWN_LEFT: usize = 30;
+    pub const MOUTH_FROWN_RIGHT: usize = 31;
+    pub const MOUTH_FUNNEL: usize = 32;
+    pub const MOUTH_PUCKER: usize = 38;
+    pub const MOUTH_SMILE_LEFT: usize = 44;
+    pub const MOUTH_SMILE_RIGHT: usize = 45;
+    pub const MOUTH_STRETCH_LEFT: usize = 46;
+    pub const MOUTH_STRETCH_RIGHT: usize = 47;
+}
+
+/// Landmarks that define the head's axes: the outer eye corners (image left
+/// and right), the top of the forehead and the chin.
+const EYE_OUTER_IMAGE_LEFT: usize = 33;
+const EYE_OUTER_IMAGE_RIGHT: usize = 263;
+const FOREHEAD: usize = 10;
+const CHIN: usize = 152;
 
 /// Frames averaged to capture the neutral face.
 const CALIBRATION_FRAMES: u32 = 20;
@@ -22,37 +62,29 @@ const YAW_RANGE: f32 = 0.70;
 const PITCH_RANGE: f32 = 0.50;
 const ROLL_RANGE: f32 = 0.50;
 const HEAD_GAIN: f32 = 1.2;
-const MOUTH_OPEN_RANGE: f32 = 0.35; // inner lip gap, in eye distances
-const MOUTH_WIDTH_GAIN: f32 = 5.0;
-/// An eye counts as fully closed at this fraction of its neutral openness.
-const EYE_CLOSED_RATIO: f32 = 0.55;
+
+// Blendshape change from neutral that counts as the full expression.
+const JAW_RANGE: f32 = 0.5;
+const MOUTH_WIDTH_RANGE: f32 = 0.5;
+const SMILE_RANGE: f32 = 0.6;
+const FROWN_RANGE: f32 = 0.4;
+const BROW_RAISE_RANGE: f32 = 0.5;
+const BROW_LOWER_RANGE: f32 = 0.4;
+const SQUINT_RANGE: f32 = 0.5;
+const GAZE_RANGE: f32 = 0.6;
+/// Blink value at which an eye is fully shut.
+const BLINK_FULL: f32 = 0.6;
+/// Small changes from neutral are ignored, so a resting face stays neutral.
+const EXPRESSION_DEAD_ZONE: f32 = 0.15;
 /// Blink is on/off with hysteresis: closes above the first, opens below the second.
 const BLINK_CLOSE: f32 = 0.65;
 const BLINK_OPEN: f32 = 0.40;
 /// Eyes this similar blink together; a bigger difference is a wink.
 const WINK_DIFFERENCE: f32 = 0.45;
-/// Mouth-corner lift / eyebrow raise (in eye distances) for a full expression,
-/// after a dead zone so a resting face stays neutral.
-const SMILE_RANGE: f32 = 0.12;
-const BROW_RANGE: f32 = 0.14;
-const EXPRESSION_DEAD_ZONE: f32 = 0.25;
-/// Mouth-corner drop / eyebrow lowering (in eye distances) for a full value.
-const FROWN_RANGE: f32 = 0.10;
-const BROW_LOWER_RANGE: f32 = 0.10;
-/// Eye closedness (0 open .. 1 shut) where a held narrowing of the eyes
-/// starts and where it counts as full. Blinks are handled separately.
-const SQUINT_START: f32 = 0.15;
-const SQUINT_FULL: f32 = 0.60;
 /// Leaning toward the camera: relative growth of the face that maps to 1.
 const LEAN_RANGE: f32 = 0.35;
 /// Vertical face travel, as a fraction of the frame width, that maps to 1.
 const BODY_Y_RANGE: f32 = 0.20;
-/// Small eye darts while idle: how far (of the eye's range), and how often.
-const SACCADE_X: f32 = 0.30;
-const SACCADE_Y: f32 = 0.15;
-const SACCADE_MIN_SECONDS: f32 = 1.2;
-const SACCADE_EXTRA_SECONDS: f32 = 2.6;
-const GAZE_RATE: f32 = 30.0;
 
 /// How fast the presented state follows its target, per second.
 const HEAD_RATE: f32 = 16.0;
@@ -60,6 +92,7 @@ const MOUTH_RATE: f32 = 28.0;
 const BLINK_RATE: f32 = 45.0;
 const EXPRESSION_RATE: f32 = 12.0;
 const BODY_RATE: f32 = 8.0;
+const GAZE_RATE: f32 = 30.0;
 
 /// Without a face for this long, the avatar returns to neutral and idles.
 const LOST_AFTER: Duration = Duration::from_millis(600);
@@ -67,6 +100,11 @@ const AUTO_BLINK_SECONDS: f32 = 0.13;
 /// Idle head sway amplitude, in `FaceState` units.
 const SWAY: f32 = 0.025;
 const BREATH_SECONDS: f32 = 3.6;
+/// Small eye darts while nobody is tracked: how far, and how often.
+const SACCADE_X: f32 = 0.30;
+const SACCADE_Y: f32 = 0.15;
+const SACCADE_MIN_SECONDS: f32 = 1.2;
+const SACCADE_EXTRA_SECONDS: f32 = 2.6;
 
 /// Expression values for the avatar. Head angles and positions are -1..1 with
 /// 0 at the calibrated neutral pose; blink, mouth-open, smile and brow-raise
@@ -105,93 +143,67 @@ pub struct FaceState {
 const YAW: usize = 0;
 const PITCH: usize = 1;
 const ROLL: usize = 2;
-const EAR_LEFT: usize = 3;
-const EAR_RIGHT: usize = 4;
-const MOUTH_GAP: usize = 5;
-const MOUTH_WIDTH: usize = 6;
-const SMILE: usize = 7;
-const BROW: usize = 8;
-const X: usize = 9;
-const Y: usize = 10;
-const SCALE: usize = 11;
-const FEATURE_COUNT: usize = 12;
+const X: usize = 3;
+const Y: usize = 4;
+const SCALE: usize = 5;
+const BLINK_IMAGE_LEFT: usize = 6;
+const BLINK_IMAGE_RIGHT: usize = 7;
+const JAW: usize = 8;
+const MOUTH_WIDE: usize = 9;
+const MOUTH_ROUND: usize = 10;
+const SMILE: usize = 11;
+const FROWN: usize = 12;
+const BROW_UP: usize = 13;
+const BROW_DOWN: usize = 14;
+const SQUINT: usize = 15;
+const GAZE_X: usize = 16;
+const GAZE_Y: usize = 17;
+const FEATURE_COUNT: usize = 18;
 
-/// Raw geometric measurements from one set of landmarks (300-W layout).
-/// Left/right are as seen in the image.
+/// Raw measurements from one tracked face. Directions are as seen in the
+/// camera image (x right, y down); angles are in radians.
 type Features = [f32; FEATURE_COUNT];
 
-fn features(points: &[[f32; 2]], frame_w: f32) -> Option<Features> {
-    if points.len() != 68 {
-        return None;
-    }
-    let eye_left = centroid(&points[36..42]);
-    let eye_right = centroid(&points[42..48]);
-    let eye_dist = dist(eye_left, eye_right);
-    if eye_dist < 1.0 {
-        return None;
-    }
-    let roll = (eye_right[1] - eye_left[1]).atan2(eye_right[0] - eye_left[0]);
-    let eye_mid = [(eye_left[0] + eye_right[0]) / 2.0, (eye_left[1] + eye_right[1]) / 2.0];
-    let (yaw, pitch) = head_direction(points)?;
+fn features(face: &FaceTrack, frame_w: f32) -> Option<Features> {
+    let point = |index: usize| face.points.get(index).map(|p| Vec3::from(*p));
+    let (eye_a, eye_b) = (point(EYE_OUTER_IMAGE_LEFT)?, point(EYE_OUTER_IMAGE_RIGHT)?);
+    // The head's own axes. Image y points down and z points away from the
+    // camera, so a face looking straight at it has `forward` = (0, 0, -1).
+    let right = (eye_b - eye_a).try_normalize()?;
+    let up = (point(FOREHEAD)? - point(CHIN)?).try_normalize()?;
+    let forward = right.cross(up).try_normalize()?;
+    let eye_mid = (eye_a + eye_b) / 2.0;
 
-    // Height above the eye line along the face's own up axis (undoing roll),
-    // in eye distances.
-    let (sin, cos) = roll.sin_cos();
-    let height = |p: [f32; 2]| -((p[1] - eye_mid[1]) * cos - (p[0] - eye_mid[0]) * sin) / eye_dist;
-    let mouth_center = (height(points[51]) + height(points[57])) / 2.0;
-    let mouth_corners = (height(points[48]) + height(points[54])) / 2.0;
-    let brows = (height(centroid(&points[17..22])) + height(centroid(&points[22..27]))) / 2.0;
-
+    let b: &[f32; BLENDSHAPE_COUNT] = &face.blendshapes;
+    let pair = |left: usize, right: usize| (b[left] + b[right]) / 2.0;
     let mut out = [0.0; FEATURE_COUNT];
-    out[YAW] = yaw;
-    out[PITCH] = pitch;
-    out[ROLL] = roll;
-    out[EAR_LEFT] = eye_aspect(&points[36..42]);
-    out[EAR_RIGHT] = eye_aspect(&points[42..48]);
-    out[MOUTH_GAP] = dist(points[62], points[66]) / eye_dist;
-    out[MOUTH_WIDTH] = dist(points[48], points[54]) / eye_dist;
-    out[SMILE] = mouth_corners - mouth_center;
-    out[BROW] = brows;
-    out[X] = eye_mid[0] / frame_w * 2.0 - 1.0;
-    out[Y] = eye_mid[1] / frame_w;
-    out[SCALE] = eye_dist / frame_w;
+    out[YAW] = forward.x.atan2(-forward.z);
+    out[PITCH] = forward.y.clamp(-1.0, 1.0).asin();
+    out[ROLL] = right.y.atan2(right.x);
+    out[X] = eye_mid.x / frame_w * 2.0 - 1.0;
+    out[Y] = eye_mid.y / frame_w;
+    // Measured in 3D, so turning the head doesn't read as moving away.
+    out[SCALE] = eye_a.distance(eye_b) / frame_w;
+    // The person's left eye is the one on the image's right.
+    out[BLINK_IMAGE_LEFT] = b[shape::EYE_BLINK_RIGHT];
+    out[BLINK_IMAGE_RIGHT] = b[shape::EYE_BLINK_LEFT];
+    out[JAW] = b[shape::JAW_OPEN];
+    out[MOUTH_WIDE] = pair(shape::MOUTH_STRETCH_LEFT, shape::MOUTH_STRETCH_RIGHT);
+    out[MOUTH_ROUND] = b[shape::MOUTH_PUCKER].max(b[shape::MOUTH_FUNNEL]);
+    out[SMILE] = pair(shape::MOUTH_SMILE_LEFT, shape::MOUTH_SMILE_RIGHT);
+    out[FROWN] = pair(shape::MOUTH_FROWN_LEFT, shape::MOUTH_FROWN_RIGHT);
+    out[BROW_UP] =
+        (b[shape::BROW_INNER_UP] + pair(shape::BROW_OUTER_UP_LEFT, shape::BROW_OUTER_UP_RIGHT)) / 2.0;
+    out[BROW_DOWN] = pair(shape::BROW_DOWN_LEFT, shape::BROW_DOWN_RIGHT);
+    out[SQUINT] = pair(shape::EYE_SQUINT_LEFT, shape::EYE_SQUINT_RIGHT);
+    // Toward the image's right: the person's left eye looking out, or their
+    // right eye looking in.
+    out[GAZE_X] = ((b[shape::EYE_LOOK_OUT_LEFT] - b[shape::EYE_LOOK_IN_LEFT])
+        + (b[shape::EYE_LOOK_IN_RIGHT] - b[shape::EYE_LOOK_OUT_RIGHT]))
+        / 2.0;
+    out[GAZE_Y] = pair(shape::EYE_LOOK_DOWN_LEFT, shape::EYE_LOOK_DOWN_RIGHT)
+        - pair(shape::EYE_LOOK_UP_LEFT, shape::EYE_LOOK_UP_RIGHT);
     Some(out)
-}
-
-/// Generic face shape for the pose fit: landmark index and its 3D position
-/// (x toward image right, y up, z toward the camera, nose tip at the origin).
-const FACE_MODEL: [(usize, [f32; 3]); 6] = [
-    (30, [0.0, 0.0, 0.0]),       // nose tip
-    (8, [0.0, -63.6, -12.5]),    // chin
-    (36, [-43.3, 32.7, -26.0]),  // outer eye corner, image left
-    (45, [43.3, 32.7, -26.0]),   // outer eye corner, image right
-    (48, [-28.9, -28.9, -24.1]), // mouth corner, image left
-    (54, [28.9, -28.9, -24.1]),  // mouth corner, image right
-];
-
-/// Head yaw and pitch in radians (yaw toward image right, pitch down), by
-/// fitting `FACE_MODEL` to the landmarks under a scaled orthographic camera:
-/// least squares for the two image-plane rows of the rotation.
-fn head_direction(points: &[[f32; 2]]) -> Option<(f32, f32)> {
-    let mut ata = Mat4::ZERO;
-    let (mut atb_x, mut atb_y) = (Vec4::ZERO, Vec4::ZERO);
-    for (index, model) in FACE_MODEL {
-        let row = Vec4::new(model[0], model[1], model[2], 1.0);
-        ata += Mat4::from_cols(row * row.x, row * row.y, row * row.z, row * row.w);
-        atb_x += row * points[index][0];
-        // Image y points down.
-        atb_y += row * -points[index][1];
-    }
-    if ata.determinant().abs() < 1e-3 {
-        return None;
-    }
-    let inverse = ata.inverse();
-    let right = (inverse * atb_x).truncate().try_normalize()?;
-    let up = (inverse * atb_y).truncate().try_normalize()?;
-    let toward_camera = right.cross(up).try_normalize()?;
-    // Where the face points, in camera axes.
-    let forward = Vec3::new(right.z, up.z, toward_camera.z);
-    Some((forward.x.atan2(forward.z), (-forward.y).clamp(-1.0, 1.0).asin()))
 }
 
 /// Converts track results into a smoothed, calibrated `FaceState`.
@@ -200,8 +212,8 @@ pub struct FaceSolver {
     calibration_sum: Features,
     calibration_count: u32,
     /// yaw, pitch, roll, mouth open, mouth width, smile, brow raise, x,
-    /// brow lower, frown, squint, y, lean.
-    filters: [OneEuro; 13],
+    /// brow lower, frown, squint, y, lean, gaze x, gaze y.
+    filters: [OneEuro; 15],
     last_update: Option<Instant>,
     /// Blink state per eye (image left, image right), with hysteresis.
     eye_closed: [bool; 2],
@@ -214,8 +226,8 @@ pub struct FaceSolver {
     /// Seconds of animation time, for idle motion.
     clock: f32,
     next_blink: f32,
-    /// Current eye-dart target and when the next one is due.
-    gaze: [f32; 2],
+    /// Idle eye-dart target and when the next one is due.
+    idle_gaze: [f32; 2],
     next_saccade: f32,
     random: u32,
     /// Move like a mirror image (VTuber convention) instead of like the camera view.
@@ -229,16 +241,15 @@ impl Default for FaceSolver {
         let head = OneEuro::new(1.2, 0.6);
         let mouth = OneEuro::new(5.0, 2.0);
         let expression = OneEuro::new(1.5, 0.5);
+        let gaze = OneEuro::new(3.0, 1.5);
         Self {
             neutral: None,
             calibration_sum: [0.0; FEATURE_COUNT],
             calibration_count: 0,
             filters: [
                 head, head, head, mouth, mouth, expression, expression, head, expression, expression, expression,
-                head, head,
+                head, head, gaze, gaze,
             ],
-            gaze: [0.0; 2],
-            next_saccade: 1.5,
             last_update: None,
             eye_closed: [false; 2],
             target: FaceState::default(),
@@ -247,6 +258,8 @@ impl Default for FaceSolver {
             last_advance: None,
             clock: 0.0,
             next_blink: 2.0,
+            idle_gaze: [0.0; 2],
+            next_saccade: 1.5,
             random: 0x2545_F491,
             mirror: true,
             state: FaceState::default(),
@@ -268,10 +281,10 @@ impl FaceSolver {
 
     /// Feed one tracking result. Call for every result from the tracker.
     pub fn update(&mut self, result: &TrackResult) {
-        let Some(head) = &result.head else {
+        let Some(face) = &result.face else {
             return;
         };
-        let Some(f) = features(&head.points, result.frame_w as f32) else {
+        let Some(f) = features(face, result.frame_w as f32) else {
             return;
         };
         self.last_face = Some(Instant::now());
@@ -289,14 +302,9 @@ impl FaceSolver {
 
         // Blinks are not smoothed: they snap shut and open, and both eyes
         // move together unless one is clearly more closed (a wink).
-        let closedness = |ear: f32, open: f32| {
-            let closed = open * EYE_CLOSED_RATIO;
-            1.0 - ((ear - closed) / (open - closed).max(1e-3)).clamp(0.0, 1.0)
-        };
-        let mut eyes = [
-            closedness(f[EAR_LEFT], n[EAR_LEFT]),
-            closedness(f[EAR_RIGHT], n[EAR_RIGHT]),
-        ];
+        let closedness =
+            |index: usize| ((f[index] - n[index]) / (BLINK_FULL - n[index]).max(0.1)).clamp(0.0, 1.0);
+        let mut eyes = [closedness(BLINK_IMAGE_LEFT), closedness(BLINK_IMAGE_RIGHT)];
         if (eyes[0] - eyes[1]).abs() < WINK_DIFFERENCE {
             eyes = [(eyes[0] + eyes[1]) / 2.0; 2];
         }
@@ -307,45 +315,48 @@ impl FaceSolver {
                 *closed = false;
             }
         }
-        // Eyes held partly closed (not a blink) narrow the avatar's eyes. The
-        // slow filter on this value keeps quick blinks out of it.
+
+        // Change from neutral, as a 0..1 expression with a dead zone.
+        let expression = |index: usize, range: f32| {
+            (((f[index] - n[index]) / range - EXPRESSION_DEAD_ZONE) / (1.0 - EXPRESSION_DEAD_ZONE)).clamp(0.0, 1.0)
+        };
+        // Narrowed eyes are a held expression; a blink is not one.
         let squint = if self.eye_closed.contains(&true) {
             0.0
         } else {
-            (((eyes[0] + eyes[1]) / 2.0 - SQUINT_START) / (SQUINT_FULL - SQUINT_START)).clamp(0.0, 1.0)
+            expression(SQUINT, SQUINT_RANGE)
         };
-
-        let expression = |value: f32, range: f32| {
-            ((value / range - EXPRESSION_DEAD_ZONE) / (1.0 - EXPRESSION_DEAD_ZONE)).clamp(0.0, 1.0)
-        };
+        let mouth_width = ((f[MOUTH_WIDE] - n[MOUTH_WIDE]) - (f[MOUTH_ROUND] - n[MOUTH_ROUND])) / MOUTH_WIDTH_RANGE;
         let raw = [
             ((f[YAW] - n[YAW]) / YAW_RANGE * HEAD_GAIN).clamp(-1.0, 1.0),
             ((f[PITCH] - n[PITCH]) / PITCH_RANGE * HEAD_GAIN).clamp(-1.0, 1.0),
             ((f[ROLL] - n[ROLL]) / ROLL_RANGE).clamp(-1.0, 1.0),
-            ((f[MOUTH_GAP] - n[MOUTH_GAP]) / MOUTH_OPEN_RANGE).clamp(0.0, 1.0),
-            ((f[MOUTH_WIDTH] / n[MOUTH_WIDTH].max(1e-3) - 1.0) * MOUTH_WIDTH_GAIN).clamp(-1.0, 1.0),
-            expression(f[SMILE] - n[SMILE], SMILE_RANGE),
-            expression(f[BROW] - n[BROW], BROW_RANGE),
+            ((f[JAW] - n[JAW]) / JAW_RANGE).clamp(0.0, 1.0),
+            mouth_width.clamp(-1.0, 1.0),
+            expression(SMILE, SMILE_RANGE),
+            expression(BROW_UP, BROW_RAISE_RANGE),
             (f[X] - n[X]).clamp(-1.0, 1.0),
-            expression(n[BROW] - f[BROW], BROW_LOWER_RANGE),
-            expression(n[SMILE] - f[SMILE], FROWN_RANGE),
+            expression(BROW_DOWN, BROW_LOWER_RANGE),
+            expression(FROWN, FROWN_RANGE),
             squint,
             ((n[Y] - f[Y]) / BODY_Y_RANGE).clamp(-1.0, 1.0),
             ((f[SCALE] / n[SCALE].max(1e-6) - 1.0) / LEAN_RANGE).clamp(-1.0, 1.0),
+            ((f[GAZE_X] - n[GAZE_X]) / GAZE_RANGE).clamp(-1.0, 1.0),
+            ((f[GAZE_Y] - n[GAZE_Y]) / GAZE_RANGE).clamp(-1.0, 1.0),
         ];
         let now = Instant::now();
         let dt = self
             .last_update
             .map_or(1.0 / 30.0, |t| now.duration_since(t).as_secs_f32().max(1e-3));
         self.last_update = Some(now);
-        let mut out = [0.0; 13];
+        let mut out = [0.0; 15];
         for ((o, filter), x) in out.iter_mut().zip(&mut self.filters).zip(raw) {
             *o = filter.filter(x, dt);
         }
-        let [image_left_eye, image_right_eye] = self.eye_closed.map(|closed| if closed { 1.0 } else { 0.0 });
 
         // Values so far are in camera-image space, where the eye on the
         // image's left shows on the avatar's right.
+        let [image_left_eye, image_right_eye] = self.eye_closed.map(|closed| if closed { 1.0 } else { 0.0 });
         let flip = if self.mirror { -1.0 } else { 1.0 };
         let (blink_left, blink_right) = if self.mirror {
             (image_left_eye, image_right_eye)
@@ -365,8 +376,8 @@ impl FaceSolver {
             brow_lower: out[8],
             frown: out[9],
             eye_squint: out[10],
-            gaze_x: 0.0,
-            gaze_y: 0.0,
+            gaze_x: out[13] * flip,
+            gaze_y: out[14],
             body_x: out[7] * flip,
             body_y: out[11],
             lean: out[12],
@@ -386,25 +397,23 @@ impl FaceSolver {
         let lost = self.last_face.is_none_or(|seen| now.duration_since(seen) > LOST_AFTER);
         let mut target = self.target;
         if lost {
-            // Nobody in view: relax to neutral and blink now and then.
+            // Nobody in view: relax to neutral, blink now and then, and let
+            // the eyes dart to a new spot every second or three.
             target = FaceState::default();
             if self.clock > self.next_blink + AUTO_BLINK_SECONDS {
                 self.next_blink = self.clock + 2.5 + self.random_unit() * 3.5;
             }
             let blink = if self.clock >= self.next_blink { 1.0 } else { 0.0 };
             (target.blink_left, target.blink_right) = (blink, blink);
+            if self.clock >= self.next_saccade {
+                self.idle_gaze = [
+                    (self.random_unit() * 2.0 - 1.0) * SACCADE_X,
+                    (self.random_unit() * 2.0 - 1.0) * SACCADE_Y,
+                ];
+                self.next_saccade = self.clock + SACCADE_MIN_SECONDS + self.random_unit() * SACCADE_EXTRA_SECONDS;
+            }
+            (target.gaze_x, target.gaze_y) = (self.idle_gaze[0], self.idle_gaze[1]);
         }
-
-        // Eyes are never perfectly still: every second or three they dart to
-        // a new spot near the center and hold there.
-        if self.clock >= self.next_saccade {
-            self.gaze = [
-                (self.random_unit() * 2.0 - 1.0) * SACCADE_X,
-                (self.random_unit() * 2.0 - 1.0) * SACCADE_Y,
-            ];
-            self.next_saccade = self.clock + SACCADE_MIN_SECONDS + self.random_unit() * SACCADE_EXTRA_SECONDS;
-        }
-        let gaze = self.gaze;
 
         let ease = |value: &mut f32, target: f32, rate: f32| {
             *value += (target - *value) * (1.0 - (-rate * dt).exp());
@@ -419,14 +428,14 @@ impl FaceSolver {
         ease(&mut eased.mouth_width, target.mouth_width, MOUTH_RATE);
         ease(&mut eased.smile, target.smile, EXPRESSION_RATE);
         ease(&mut eased.brow_raise, target.brow_raise, EXPRESSION_RATE);
-        ease(&mut eased.body_x, target.body_x, BODY_RATE);
-        ease(&mut eased.body_y, target.body_y, BODY_RATE);
-        ease(&mut eased.lean, target.lean, BODY_RATE);
         ease(&mut eased.brow_lower, target.brow_lower, EXPRESSION_RATE);
         ease(&mut eased.frown, target.frown, EXPRESSION_RATE);
         ease(&mut eased.eye_squint, target.eye_squint, EXPRESSION_RATE);
-        ease(&mut eased.gaze_x, gaze[0], GAZE_RATE);
-        ease(&mut eased.gaze_y, gaze[1], GAZE_RATE);
+        ease(&mut eased.gaze_x, target.gaze_x, GAZE_RATE);
+        ease(&mut eased.gaze_y, target.gaze_y, GAZE_RATE);
+        ease(&mut eased.body_x, target.body_x, BODY_RATE);
+        ease(&mut eased.body_y, target.body_y, BODY_RATE);
+        ease(&mut eased.lean, target.lean, BODY_RATE);
 
         // Idle motion on top, so the avatar is never perfectly still.
         let t = self.clock;
@@ -439,7 +448,7 @@ impl FaceSolver {
         };
     }
 
-    /// Pseudo-random value in 0..1 (xorshift), for blink timing.
+    /// Pseudo-random value in 0..1 (xorshift), for idle timing.
     fn random_unit(&mut self) -> f32 {
         self.random ^= self.random << 13;
         self.random ^= self.random >> 17;
@@ -486,20 +495,4 @@ impl OneEuro {
         self.x = Some(smoothed);
         smoothed
     }
-}
-
-fn centroid(points: &[[f32; 2]]) -> [f32; 2] {
-    let n = points.len() as f32;
-    points
-        .iter()
-        .fold([0.0, 0.0], |acc, p| [acc[0] + p[0] / n, acc[1] + p[1] / n])
-}
-
-fn dist(a: [f32; 2], b: [f32; 2]) -> f32 {
-    (a[0] - b[0]).hypot(a[1] - b[1])
-}
-
-/// Eye aspect ratio: eyelid gap over eye width (6 points, 300-W order).
-fn eye_aspect(eye: &[[f32; 2]]) -> f32 {
-    (dist(eye[1], eye[5]) + dist(eye[2], eye[4])) / (2.0 * dist(eye[0], eye[3]).max(1e-3))
 }

@@ -1,82 +1,79 @@
+//! Stage 2: face tracking with Google's MediaPipe Face Landmarker models
+//! (see `models/mediapipe/README.md`).
+//!
+//! Three small models run on the tracker thread for every camera frame:
+//! BlazeFace finds the face (only when it isn't being tracked already), the
+//! landmark model places 478 3D points on a rotated crop around it, and the
+//! blendshape model turns a subset of those points into 52 expression values.
+//! While the face stays in view, the next crop comes from the landmarks.
+
 use cameras::PixelFormat;
-use ndarray::Array4;
-use ort::environment::Environment;
-use ort::ep::{self, coreml};
+use ndarray::{Array3, Array4};
 use ort::{session::Session, value::Tensor};
 use std::borrow::Cow;
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-const MODEL_DIR: &str = "models/face_landmark";
+const MODEL_DIR: &str = "models/mediapipe";
+const DETECTOR_FILE: &str = "face_detector.onnx";
+const LANDMARKS_FILE: &str = "face_landmarks_detector.onnx";
+const BLENDSHAPES_FILE: &str = "face_blendshapes.onnx";
 
-/// Models live in `Contents/Resources` when running from a macOS .app bundle
-/// (where the working directory is `/`), otherwise relative to the working
-/// directory.
-fn model_path(file: &str) -> std::path::PathBuf {
-    let bundled = std::env::current_exe()
-        .ok()
-        .and_then(|exe| {
-            Some(
-                exe.parent()?
-                    .parent()?
-                    .join("Resources")
-                    .join(MODEL_DIR)
-                    .join(file),
-            )
-        })
-        .filter(|path| path.exists());
-    bundled.unwrap_or_else(|| std::path::Path::new(MODEL_DIR).join(file))
-}
-const DETECTOR_PATH: &str = "yolov4_headdetection_480x640.onnx";
-const LANDMARK_PATH: &str = "face_landmark_Nx3x160x160.onnx";
-
-const DET_W: usize = 640;
-const DET_H: usize = 480;
+const DET_SIZE: usize = 128;
 const DET_INPUT: &str = "input";
-const DET_BOXES: &str = "boxes";
-const DET_CONFS: &str = "confs";
-const CONF_THRESH: f32 = 0.6;
-const NMS_THRESH: f32 = 0.5;
+const DET_BOXES: &str = "regressors";
+const DET_SCORES: &str = "classificators";
+/// Values per detection: box center, size, then 6 key points (x, y).
+const DET_VALUES: usize = 16;
+const DET_MIN_SCORE: f32 = 0.5;
 
-const LAND_W: usize = 160;
-const LAND_H: usize = 160;
-const LAND_INPUT: &str = "images";
-const LANDMARK_OUT: &str = "Identity_2";
-const POSE_OUT: &str = "Identity_1";
-const STATE_OUT: &str = "Identity";
+const LAND_SIZE: usize = 256;
+const LAND_INPUT: &str = "input_12";
+const LAND_POINTS: &str = "Identity";
+const LAND_PRESENCE: &str = "Identity_1";
+pub const LANDMARK_COUNT: usize = 478;
+const MIN_PRESENCE: f32 = 0.5;
 
-/// How often the detector re-checks the head box while a face is being tracked.
-/// Between detections the box follows the landmarks.
-const DETECT_INTERVAL: Duration = Duration::from_millis(400);
-const HEAD_EXPAND: f32 = 0.25;
-/// If the landmark-following box moves further than this fraction of its size
-/// from the last detection, the crop has likely slipped off the face: drop it
-/// and wait for a fresh detection instead of tracking noise.
-const MAX_DRIFT: f32 = 0.5;
-/// A fresh detection of the same head only nudges the tracked box by this
-/// fraction; replacing it outright makes the crop, and so every landmark, jump.
-const DETECT_BLEND: f32 = 0.25;
-/// Detections overlapping the tracked box at least this much are the same head.
-const SAME_HEAD_IOU: f32 = 0.4;
-/// The box ignores landmark-centroid movement below this fraction of its
-/// size, so the crop holds still while the head does.
-const FOLLOW_DEAD_ZONE: f32 = 0.015;
+const BLEND_INPUT: &str = "serving_default_input_points:0";
+const BLEND_OUTPUT: &str = "StatefulPartitionedCall:0";
+pub const BLENDSHAPE_COUNT: usize = 52;
 
-pub struct HeadTrack {
-    #[allow(dead_code)]
-    pub rect: [f32; 4],
-    pub points: Vec<[f32; 2]>,
-    #[allow(dead_code)]
-    pub pose: [f32; 3],
-    #[allow(dead_code)]
-    pub states: [f32; 4],
+/// The crop is this much larger than the face box, as MediaPipe does.
+const ROI_SCALE: f32 = 1.5;
+/// Landmarks that set the crop's rotation: the outer corners of the eyes.
+const EYE_OUTER_IMAGE_LEFT: usize = 33;
+const EYE_OUTER_IMAGE_RIGHT: usize = 263;
+/// The crop holds still unless the face moved by this fraction of its size,
+/// grew or shrank by this fraction, or turned by this angle. A crop that
+/// follows every pixel of landmark noise feeds that noise back in.
+const ROI_MOVE_TOLERANCE: f32 = 0.02;
+const ROI_SIZE_TOLERANCE: f32 = 0.05;
+const ROI_ANGLE_TOLERANCE: f32 = 0.05;
+
+/// Landmarks the blendshape model reads, in the order it expects them.
+const BLENDSHAPE_LANDMARKS: [usize; 146] = [
+    0, 1, 4, 5, 6, 7, 8, 10, 13, 14, 17, 21, 33, 37, 39, 40, 46, 52, 53, 54, 55, 58, 61, 63, 65, 66, 67, 70, 78, 80,
+    81, 82, 84, 87, 88, 91, 93, 95, 103, 105, 107, 109, 127, 132, 133, 136, 144, 145, 146, 148, 149, 150, 152, 153,
+    154, 155, 157, 158, 159, 160, 161, 162, 163, 168, 172, 173, 176, 178, 181, 185, 191, 195, 197, 234, 246, 249, 251,
+    263, 267, 269, 270, 276, 282, 283, 284, 285, 288, 291, 293, 295, 296, 297, 300, 308, 310, 311, 312, 314, 317, 318,
+    321, 323, 324, 332, 334, 336, 338, 356, 361, 362, 365, 373, 374, 375, 377, 378, 379, 380, 381, 382, 384, 385, 386,
+    387, 388, 389, 390, 397, 398, 400, 402, 405, 409, 415, 454, 466, 468, 469, 470, 471, 472, 473, 474, 475, 476, 477,
+];
+
+/// A tracked face. `points` are MediaPipe's 478 landmarks in frame pixels
+/// (x right, y down, z toward the camera is negative, in the same scale).
+/// `blendshapes` are the 52 ARKit-style expression values, 0..1, in
+/// MediaPipe's order (see `face::shape`).
+pub struct FaceTrack {
+    pub points: Vec<[f32; 3]>,
+    pub blendshapes: [f32; BLENDSHAPE_COUNT],
 }
 
 pub struct TrackResult {
     pub frame_w: u32,
     #[allow(dead_code)]
     pub frame_h: u32,
-    pub head: Option<HeadTrack>,
+    pub face: Option<FaceTrack>,
     #[allow(dead_code)]
     pub ms: f32,
 }
@@ -91,288 +88,241 @@ pub fn spawn_tracker() -> (mpsc::Sender<cameras::Frame>, mpsc::Receiver<TrackRes
     (frame_tx, result_rx)
 }
 
-/// Head box from the detector plus the landmark-centroid offset measured on it,
-/// so later frames can re-center the box on the landmarks without drifting.
-struct Head {
-    rect: [f32; 4],
-    detected: [f32; 4],
-    centroid_offset: Option<[f32; 2]>,
+/// Models live in `Contents/Resources` when running from a macOS .app bundle
+/// (where the working directory is `/`), otherwise relative to the working
+/// directory.
+fn model_path(file: &str) -> std::path::PathBuf {
+    let bundled = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.parent()?.join("Resources").join(MODEL_DIR).join(file)))
+        .filter(|path| path.exists());
+    bundled.unwrap_or_else(|| std::path::Path::new(MODEL_DIR).join(file))
 }
 
-impl Head {
-    fn drifted(&self) -> bool {
-        let center = |r: [f32; 4]| [(r[0] + r[2]) / 2.0, (r[1] + r[3]) / 2.0];
-        let (a, b) = (center(self.rect), center(self.detected));
-        let size = (self.detected[2] - self.detected[0]).max(self.detected[3] - self.detected[1]);
-        (a[0] - b[0]).hypot(a[1] - b[1]) > size * MAX_DRIFT
+/// Square crop of the frame, rotated by `angle` around its center.
+#[derive(Clone, Copy)]
+struct Roi {
+    cx: f32,
+    cy: f32,
+    size: f32,
+    angle: f32,
+}
+
+impl Roi {
+    /// Frame position of a point given in crop coordinates (0..1 across it).
+    fn to_frame(&self, u: f32, v: f32) -> [f32; 2] {
+        let (sin, cos) = self.angle.sin_cos();
+        let (u, v) = ((u - 0.5) * self.size, (v - 0.5) * self.size);
+        [self.cx + u * cos - v * sin, self.cy + u * sin + v * cos]
     }
+
+    /// Whether `other` is close enough that keeping this crop is better.
+    fn close_to(&self, other: &Roi) -> bool {
+        let moved = (self.cx - other.cx).hypot(self.cy - other.cy);
+        moved < self.size * ROI_MOVE_TOLERANCE
+            && (self.size - other.size).abs() < self.size * ROI_SIZE_TOLERANCE
+            && (self.angle - other.angle).abs() < ROI_ANGLE_TOLERANCE
+    }
+}
+
+struct Models {
+    detector: Session,
+    landmarks: Session,
+    blendshapes: Session,
+    anchors: Vec<[f32; 2]>,
 }
 
 fn tracker_loop(rx: mpsc::Receiver<cameras::Frame>, tx: mpsc::Sender<TrackResult>) {
     set_interactive_priority();
-    let environment = match ort::init().build() {
-        Ok(env) => env,
-        Err(error) => {
-            eprintln!("face tracker: onnxruntime init failed: {error}");
-            return;
-        }
-    };
-    // The landmark model is too small to benefit from more threads, and spinning
-    // worker threads would compete with the detector and camera threads.
-    let mut landmark = match Session::builder(&environment)
-        .and_then(|b| Ok(b.with_intra_threads(1)?))
-        .and_then(|b| Ok(b.with_intra_op_spinning(false)?))
-        .and_then(|mut b| b.commit_from_file(model_path(LANDMARK_PATH)))
-    {
-        Ok(s) => s,
-        Err(error) => {
-            eprintln!("face tracker: loading {LANDMARK_PATH} failed: {error}");
-            return;
-        }
-    };
-    let Some(detector) = load_detector(&environment) else {
+    let Some(mut models) = load_models() else {
         return;
     };
-    let (det_tx, det_rx) = spawn_detector(detector);
-
-    let mut head: Option<Head> = None;
-    let mut detector_busy = false;
-    let mut last_detect: Option<Instant> = None;
+    let mut roi: Option<Roi> = None;
 
     while let Ok(mut frame) = rx.recv() {
         while let Ok(newer) = rx.try_recv() {
             frame = newer;
         }
         let start = Instant::now();
-
-        while let Ok(detected) = det_rx.try_recv() {
-            detector_busy = false;
-            head = match (head.take(), detected) {
-                (Some(mut tracked), Some(rect)) if iou(&tracked.rect, &rect) >= SAME_HEAD_IOU => {
-                    for (edge, detected_edge) in tracked.rect.iter_mut().zip(rect) {
-                        *edge += (detected_edge - *edge) * DETECT_BLEND;
-                    }
-                    tracked.detected = rect;
-                    Some(tracked)
-                }
-                (_, detected) => detected.map(|rect| Head {
-                    rect,
-                    detected: rect,
-                    centroid_offset: None,
-                }),
-            };
-        }
-        let detect_due =
-            head.is_none() || last_detect.is_none_or(|t| t.elapsed() >= DETECT_INTERVAL);
-        if !detector_busy && detect_due {
-            if det_tx.send(frame.clone()).is_err() {
-                return;
-            }
-            detector_busy = true;
-            last_detect = Some(Instant::now());
-        }
-
-        let track = head
-            .as_mut()
-            .and_then(|head| track_landmarks(&mut landmark, &frame, head));
-        if head.as_ref().is_some_and(Head::drifted) {
-            head = None;
+        let face = Pixels::from_frame(&frame).and_then(|pixels| track(&mut models, &pixels, &mut roi));
+        if face.is_none() {
+            roi = None;
         }
         let _ = tx.send(TrackResult {
             frame_w: frame.width,
             frame_h: frame.height,
-            head: track,
+            face,
             ms: start.elapsed().as_secs_f32() * 1000.0,
         });
     }
 }
 
-/// Runs the head detector on its own thread, since it is far slower than the
-/// landmark model. Replies with the best head box in frame coordinates.
-fn spawn_detector(
-    mut detector: Session,
-) -> (
-    mpsc::Sender<cameras::Frame>,
-    mpsc::Receiver<Option<[f32; 4]>>,
-) {
-    let (frame_tx, frame_rx) = mpsc::channel::<cameras::Frame>();
-    let (box_tx, box_rx) = mpsc::channel::<Option<[f32; 4]>>();
-    std::thread::Builder::new()
-        .name("head-detector".into())
-        .spawn(move || {
-            while let Ok(mut frame) = frame_rx.recv() {
-                while let Ok(newer) = frame_rx.try_recv() {
-                    frame = newer;
-                }
-                if box_tx.send(detect(&mut detector, &frame)).is_err() {
-                    return;
-                }
-            }
-        })
-        .expect("spawn head detector");
-    (frame_tx, box_rx)
-}
-
-/// CoreML runs the detector about 8x faster than CPU on Apple Silicon; fall back
-/// to CPU where it is unavailable.
-fn load_detector(environment: &Environment) -> Option<Session> {
-    let path = model_path(DETECTOR_PATH);
-    let coreml = Session::builder(environment)
-        .and_then(|b| Ok(b.with_intra_op_spinning(false)?))
-        .and_then(|b| {
-            Ok(b.with_execution_providers([ep::CoreML::default()
-                .with_model_format(coreml::ModelFormat::MLProgram)
-                .with_compute_units(coreml::ComputeUnits::All)
-                .build()
-                .error_on_failure()])?)
-        })
-        .and_then(|mut b| b.commit_from_file(&path));
-    match coreml {
-        Ok(session) => Some(session),
-        Err(error) => {
-            eprintln!("face tracker: CoreML unavailable for detector ({error}), using CPU");
-            Session::builder(environment)
-                .and_then(|mut b| b.commit_from_file(&path))
-                .inspect_err(|error| {
-                    eprintln!("face tracker: loading {DETECTOR_PATH} failed: {error}")
-                })
-                .ok()
-        }
-    }
-}
-
-fn detect(detector: &mut Session, frame: &cameras::Frame) -> Option<[f32; 4]> {
-    let pixels = Pixels::from_frame(frame)?;
-    let (w, h) = (pixels.width as f32, pixels.height as f32);
-    let scale = (DET_W as f32 / w).min(DET_H as f32 / h);
-    let new_w = (w * scale).round() as usize;
-    let new_h = (h * scale).round() as usize;
-    let pad_left = (DET_W - new_w) / 2;
-    let pad_top = (DET_H - new_h) / 2;
-
-    let mut det_input = Array4::<f32>::zeros((1, 3, DET_H, DET_W));
-    pixels.resample_into(
-        det_input.as_slice_mut()?,
-        DET_W,
-        DET_H,
-        [0.0, 0.0, w, h],
-        [pad_left, pad_top, new_w, new_h],
-        1.0 / 255.0,
-    );
-    let outputs = detector
-        .run(ort::inputs![DET_INPUT => Tensor::from_array(det_input).ok()?])
+fn load_models() -> Option<Models> {
+    let environment = ort::init()
+        .build()
+        .inspect_err(|error| eprintln!("face tracker: onnxruntime init failed: {error}"))
         .ok()?;
-    let (_, confs) = outputs[DET_CONFS].try_extract_tensor::<f32>().ok()?;
-    let (_, boxes) = outputs[DET_BOXES].try_extract_tensor::<f32>().ok()?;
-    let mut candidates: Vec<(f32, [f32; 4])> = (0..confs.len())
-        .filter(|&i| confs[i] > CONF_THRESH)
-        .map(|i| {
-            let b = &boxes[i * 4..i * 4 + 4];
-            (
-                confs[i],
-                [
-                    b[0] * DET_W as f32,
-                    b[1] * DET_H as f32,
-                    b[2] * DET_W as f32,
-                    b[3] * DET_H as f32,
-                ],
-            )
-        })
-        .collect();
-    candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
-    let kept = nms(&candidates, NMS_THRESH);
-    let best = kept.first().map(|(_, b)| *b)?;
-    Some([
-        (best[0] - pad_left as f32) / scale,
-        (best[1] - pad_top as f32) / scale,
-        (best[2] - pad_left as f32) / scale,
-        (best[3] - pad_top as f32) / scale,
-    ])
+    // The models are small; more threads, or threads that spin while idle,
+    // only compete with the camera and render threads.
+    let load = |file: &str| {
+        Session::builder(&environment)
+            .and_then(|b| Ok(b.with_intra_threads(2)?))
+            .and_then(|b| Ok(b.with_intra_op_spinning(false)?))
+            .and_then(|mut b| b.commit_from_file(model_path(file)))
+            .inspect_err(|error| eprintln!("face tracker: loading {file} failed: {error}"))
+            .ok()
+    };
+    Some(Models {
+        detector: load(DETECTOR_FILE)?,
+        landmarks: load(LANDMARKS_FILE)?,
+        blendshapes: load(BLENDSHAPES_FILE)?,
+        anchors: detector_anchors(),
+    })
 }
 
-fn track_landmarks(
-    landmark: &mut Session,
-    frame: &cameras::Frame,
-    head: &mut Head,
-) -> Option<HeadTrack> {
-    let pixels = Pixels::from_frame(frame)?;
-    let crop_rect = expand(
-        head.rect,
-        HEAD_EXPAND,
-        pixels.width as f32,
-        pixels.height as f32,
-    );
-    let crop_w = crop_rect[2] - crop_rect[0];
-    let crop_h = crop_rect[3] - crop_rect[1];
-    if crop_w < 1.0 || crop_h < 1.0 {
+/// One frame: find the face if it isn't tracked, place the landmarks, read the
+/// expression values, and derive the next frame's crop from the landmarks.
+fn track(models: &mut Models, pixels: &Pixels, roi: &mut Option<Roi>) -> Option<FaceTrack> {
+    let current = match *roi {
+        Some(roi) => roi,
+        None => detect(models, pixels)?,
+    };
+    let points = landmarks(&mut models.landmarks, pixels, current)?;
+    let next = roi_from_landmarks(&points);
+    *roi = Some(if current.close_to(&next) { current } else { next });
+
+    let mut input = Array3::<f32>::zeros((1, BLENDSHAPE_LANDMARKS.len(), 2));
+    for (row, &index) in BLENDSHAPE_LANDMARKS.iter().enumerate() {
+        input[[0, row, 0]] = points[index][0];
+        input[[0, row, 1]] = points[index][1];
+    }
+    let outputs = models
+        .blendshapes
+        .run(ort::inputs![BLEND_INPUT => Tensor::from_array(input).ok()?])
+        .ok()?;
+    let (_, values) = outputs[BLEND_OUTPUT].try_extract_tensor::<f32>().ok()?;
+    let mut blendshapes = [0.0; BLENDSHAPE_COUNT];
+    if values.len() < BLENDSHAPE_COUNT {
         return None;
     }
+    blendshapes.copy_from_slice(&values[..BLENDSHAPE_COUNT]);
+    Some(FaceTrack { points, blendshapes })
+}
 
-    let mut input = Array4::<f32>::zeros((1, 3, LAND_H, LAND_W));
-    pixels.resample_into(
-        input.as_slice_mut()?,
-        LAND_W,
-        LAND_H,
-        crop_rect,
-        [0, 0, LAND_W, LAND_H],
-        1.0,
-    );
+/// BlazeFace's fixed anchor grid: 16x16 cells with 2 anchors each, then 8x8
+/// cells with 6. Each entry is the anchor's center, 0..1 across the input.
+fn detector_anchors() -> Vec<[f32; 2]> {
+    let mut anchors = Vec::with_capacity(896);
+    for (cells, per_cell) in [(16, 2), (8, 6)] {
+        for y in 0..cells {
+            for x in 0..cells {
+                let center = [(x as f32 + 0.5) / cells as f32, (y as f32 + 0.5) / cells as f32];
+                anchors.extend(std::iter::repeat_n(center, per_cell));
+            }
+        }
+    }
+    anchors
+}
 
-    let outputs = landmark
+/// Run the detector on the whole frame (letterboxed into a square) and return
+/// the crop for the best face, if any.
+fn detect(models: &mut Models, pixels: &Pixels) -> Option<Roi> {
+    let (w, h) = (pixels.width as f32, pixels.height as f32);
+    let frame = Roi {
+        cx: w / 2.0,
+        cy: h / 2.0,
+        size: w.max(h),
+        angle: 0.0,
+    };
+    let mut input = Array4::<f32>::zeros((1, DET_SIZE, DET_SIZE, 3));
+    pixels.sample(input.as_slice_mut()?, DET_SIZE, frame, -1.0, 1.0);
+    let outputs = models
+        .detector
+        .run(ort::inputs![DET_INPUT => Tensor::from_array(input).ok()?])
+        .ok()?;
+    let (_, scores) = outputs[DET_SCORES].try_extract_tensor::<f32>().ok()?;
+    let (_, boxes) = outputs[DET_BOXES].try_extract_tensor::<f32>().ok()?;
+
+    let (best, &logit) = scores.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1))?;
+    let score = 1.0 / (1.0 + (-logit.clamp(-100.0, 100.0)).exp());
+    let anchor = models.anchors.get(best)?;
+    let raw = boxes.get(best * DET_VALUES..(best + 1) * DET_VALUES)?;
+    if score < DET_MIN_SCORE {
+        return None;
+    }
+    // Offsets are in input pixels, relative to the anchor.
+    let point = |x: f32, y: f32| frame.to_frame(x / DET_SIZE as f32 + anchor[0], y / DET_SIZE as f32 + anchor[1]);
+    let center = point(raw[0], raw[1]);
+    let size = (raw[2].max(raw[3]) / DET_SIZE as f32) * frame.size;
+    // Key points 0 and 1 are the eyes; the crop is rotated to level them.
+    let (eye_a, eye_b) = (point(raw[4], raw[5]), point(raw[6], raw[7]));
+    Some(Roi {
+        cx: center[0],
+        cy: center[1],
+        size: size * ROI_SCALE,
+        angle: (eye_b[1] - eye_a[1]).atan2(eye_b[0] - eye_a[0]),
+    })
+}
+
+/// Run the landmark model on `roi`. Returns the 478 points in frame pixels,
+/// or `None` if the model sees no face there.
+fn landmarks(session: &mut Session, pixels: &Pixels, roi: Roi) -> Option<Vec<[f32; 3]>> {
+    let mut input = Array4::<f32>::zeros((1, LAND_SIZE, LAND_SIZE, 3));
+    pixels.sample(input.as_slice_mut()?, LAND_SIZE, roi, 0.0, 1.0);
+    let outputs = session
         .run(ort::inputs![LAND_INPUT => Tensor::from_array(input).ok()?])
         .ok()?;
-    let (_, points) = outputs[LANDMARK_OUT].try_extract_tensor::<f32>().ok()?;
-    let (_, pose) = outputs[POSE_OUT].try_extract_tensor::<f32>().ok()?;
-    let (_, states) = outputs[STATE_OUT].try_extract_tensor::<f32>().ok()?;
+    let (_, presence) = outputs[LAND_PRESENCE].try_extract_tensor::<f32>().ok()?;
+    let presence = 1.0 / (1.0 + (-presence.first()?.clamp(-100.0, 100.0)).exp());
+    if presence < MIN_PRESENCE {
+        return None;
+    }
+    let (_, raw) = outputs[LAND_POINTS].try_extract_tensor::<f32>().ok()?;
+    if raw.len() < LANDMARK_COUNT * 3 {
+        return None;
+    }
+    // The model answers in crop pixels; z uses the same scale as x.
+    let scale = 1.0 / LAND_SIZE as f32;
+    Some(
+        raw.chunks_exact(3)
+            .take(LANDMARK_COUNT)
+            .map(|p| {
+                let [x, y] = roi.to_frame(p[0] * scale, p[1] * scale);
+                [x, y, p[2] * scale * roi.size]
+            })
+            .collect(),
+    )
+}
 
-    let mapped: Vec<[f32; 2]> = points
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|p| [crop_rect[0] + p[0] * crop_w, crop_rect[1] + p[1] * crop_h])
-        .collect();
-
-    // Follow the face between detections: keep the detector's box size, and move
-    // its center with the landmark centroid.
-    let n = mapped.len().max(1) as f32;
-    let centroid = mapped
-        .iter()
-        .fold([0.0, 0.0], |acc, p| [acc[0] + p[0] / n, acc[1] + p[1] / n]);
-    let center = [
-        (head.rect[0] + head.rect[2]) / 2.0,
-        (head.rect[1] + head.rect[3]) / 2.0,
-    ];
-    let offset = *head
-        .centroid_offset
-        .get_or_insert([centroid[0] - center[0], centroid[1] - center[1]]);
-    let mut shift = [
-        centroid[0] - offset[0] - center[0],
-        centroid[1] - offset[1] - center[1],
-    ];
-    // Only follow movement beyond the dead zone, and only by the excess.
-    let distance = shift[0].hypot(shift[1]);
-    let dead_zone =
-        (head.rect[2] - head.rect[0]).max(head.rect[3] - head.rect[1]) * FOLLOW_DEAD_ZONE;
-    let follow = if distance > dead_zone {
-        (distance - dead_zone) / distance
-    } else {
-        0.0
-    };
-    shift = [shift[0] * follow, shift[1] * follow];
-    let rect = head.rect;
-    head.rect = [
-        rect[0] + shift[0],
-        rect[1] + shift[1],
-        rect[2] + shift[0],
-        rect[3] + shift[1],
-    ];
-
-    Some(HeadTrack {
-        rect,
-        points: mapped,
-        pose: [pose[0], pose[1], pose[2]],
-        states: [states[0], states[1], states[2], states[3]],
-    })
+/// The crop for the next frame: the landmarks' bounding box, measured along
+/// the face's own axes, enlarged and rotated to keep the eyes level.
+fn roi_from_landmarks(points: &[[f32; 3]]) -> Roi {
+    let (a, b) = (points[EYE_OUTER_IMAGE_LEFT], points[EYE_OUTER_IMAGE_RIGHT]);
+    let angle = (b[1] - a[1]).atan2(b[0] - a[0]);
+    let (mut min, mut max) = ([f32::MAX; 2], [f32::MIN; 2]);
+    for p in points {
+        for axis in 0..2 {
+            min[axis] = min[axis].min(p[axis]);
+            max[axis] = max[axis].max(p[axis]);
+        }
+    }
+    let center = [(min[0] + max[0]) / 2.0, (min[1] + max[1]) / 2.0];
+    let (sin, cos) = (-angle).sin_cos();
+    let (mut low, mut high) = ([f32::MAX; 2], [f32::MIN; 2]);
+    for p in points {
+        let (dx, dy) = (p[0] - center[0], p[1] - center[1]);
+        let upright = [dx * cos - dy * sin, dx * sin + dy * cos];
+        for axis in 0..2 {
+            low[axis] = low[axis].min(upright[axis]);
+            high[axis] = high[axis].max(upright[axis]);
+        }
+    }
+    Roi {
+        cx: center[0],
+        cy: center[1],
+        size: (high[0] - low[0]).max(high[1] - low[1]) * ROI_SCALE,
+        angle,
+    }
 }
 
 /// Read-only view of a frame's pixels as RGB, without converting the whole frame.
@@ -397,30 +347,10 @@ impl<'a> Pixels<'a> {
             }
         };
         let (data, stride, bpp, rgb_order) = match frame.pixel_format {
-            PixelFormat::Bgra8 => (
-                Cow::Borrowed(&frame.plane_primary[..]),
-                packed(4),
-                4,
-                [2, 1, 0],
-            ),
-            PixelFormat::Rgba8 => (
-                Cow::Borrowed(&frame.plane_primary[..]),
-                packed(4),
-                4,
-                [0, 1, 2],
-            ),
-            PixelFormat::Rgb8 => (
-                Cow::Borrowed(&frame.plane_primary[..]),
-                packed(3),
-                3,
-                [0, 1, 2],
-            ),
-            _ => (
-                Cow::Owned(cameras::to_rgb8(frame).ok()?),
-                width * 3,
-                3,
-                [0, 1, 2],
-            ),
+            PixelFormat::Bgra8 => (Cow::Borrowed(&frame.plane_primary[..]), packed(4), 4, [2, 1, 0]),
+            PixelFormat::Rgba8 => (Cow::Borrowed(&frame.plane_primary[..]), packed(4), 4, [0, 1, 2]),
+            PixelFormat::Rgb8 => (Cow::Borrowed(&frame.plane_primary[..]), packed(3), 3, [0, 1, 2]),
+            _ => (Cow::Owned(cameras::to_rgb8(frame).ok()?), width * 3, 3, [0, 1, 2]),
         };
         if width == 0 || height == 0 || data.len() < stride * (height - 1) + width * bpp {
             return None;
@@ -435,47 +365,36 @@ impl<'a> Pixels<'a> {
         })
     }
 
-    /// Resample the source region `src` (x1, y1, x2, y2) into the `dst` region
-    /// (x, y, w, h) of a planar RGB `out` buffer of size `out_w` x `out_h`.
-    /// Each output pixel averages a grid of bilinear samples so downscaling
-    /// doesn't alias.
-    fn resample_into(
-        &self,
-        out: &mut [f32],
-        out_w: usize,
-        out_h: usize,
-        src: [f32; 4],
-        dst: [usize; 4],
-        value_scale: f32,
-    ) {
-        let [dx, dy, dw, dh] = dst;
-        let step_x = (src[2] - src[0]) / dw as f32;
-        let step_y = (src[3] - src[1]) / dh as f32;
-        // Each tap is a bilinear sample covering 2x2 source pixels, so two
-        // taps per axis average a 4x4 block: enough for the 3-4x downscales
-        // used here, at a quarter of the cost of one tap per source pixel.
-        let taps_x = (step_x / 2.0).ceil().clamp(1.0, 2.0) as usize;
-        let taps_y = (step_y / 2.0).ceil().clamp(1.0, 2.0) as usize;
-        let weight = value_scale / (taps_x * taps_y) as f32;
-        let plane = out_w * out_h;
-        for oy in 0..dh {
-            for ox in 0..dw {
+    /// Fill `out` (`size` x `size` pixels, RGB interleaved) with the crop
+    /// `roi`, mapping 0..255 to `low..high`. Pixels outside the frame are
+    /// black. Each output pixel averages a small grid of bilinear samples, so
+    /// strong downscaling doesn't alias.
+    fn sample(&self, out: &mut [f32], size: usize, roi: Roi, low: f32, high: f32) {
+        let step = roi.size / size as f32;
+        let taps = (step / 2.0).ceil().clamp(1.0, 4.0) as usize;
+        let scale = (high - low) / 255.0 / (taps * taps) as f32;
+        let (sin, cos) = roi.angle.sin_cos();
+        let (max_x, max_y) = (self.width as f32, self.height as f32);
+        for oy in 0..size {
+            for ox in 0..size {
                 let mut sum = [0.0f32; 3];
-                for ty in 0..taps_y {
-                    let sy =
-                        src[1] + (oy as f32 + (ty as f32 + 0.5) / taps_y as f32) * step_y - 0.5;
-                    for tx in 0..taps_x {
-                        let sx =
-                            src[0] + (ox as f32 + (tx as f32 + 0.5) / taps_x as f32) * step_x - 0.5;
-                        let rgb = self.bilinear(sx, sy);
-                        sum[0] += rgb[0];
-                        sum[1] += rgb[1];
-                        sum[2] += rgb[2];
+                for ty in 0..taps {
+                    let v = (oy as f32 + (ty as f32 + 0.5) / taps as f32) / size as f32 - 0.5;
+                    for tx in 0..taps {
+                        let u = (ox as f32 + (tx as f32 + 0.5) / taps as f32) / size as f32 - 0.5;
+                        let x = roi.cx + (u * cos - v * sin) * roi.size;
+                        let y = roi.cy + (u * sin + v * cos) * roi.size;
+                        if x >= 0.0 && x < max_x && y >= 0.0 && y < max_y {
+                            let rgb = self.bilinear(x - 0.5, y - 0.5);
+                            sum[0] += rgb[0];
+                            sum[1] += rgb[1];
+                            sum[2] += rgb[2];
+                        }
                     }
                 }
-                let index = (dy + oy) * out_w + dx + ox;
-                for c in 0..3 {
-                    out[c * plane + index] = sum[c] * weight;
+                let index = (oy * size + ox) * 3;
+                for channel in 0..3 {
+                    out[index + channel] = low + sum[channel] * scale;
                 }
             }
         }
@@ -492,8 +411,7 @@ impl<'a> Pixels<'a> {
         let fy = y - y0 as f32;
         let mut rgb = [0.0; 3];
         for (c, &channel) in self.rgb_order.iter().enumerate() {
-            let at =
-                |px: usize, py: usize| self.data[py * self.stride + px * self.bpp + channel] as f32;
+            let at = |px: usize, py: usize| self.data[py * self.stride + px * self.bpp + channel] as f32;
             let top = at(x0, y0) + (at(x1, y0) - at(x0, y0)) * fx;
             let bottom = at(x0, y1) + (at(x1, y1) - at(x0, y1)) * fx;
             rgb[c] = top + (bottom - top) * fy;
@@ -503,7 +421,7 @@ impl<'a> Pixels<'a> {
 }
 
 /// Without this macOS tends to schedule the tracker on efficiency cores, which
-/// makes landmark inference about 3x slower.
+/// makes inference about 3x slower.
 #[cfg(target_os = "macos")]
 fn set_interactive_priority() {
     const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
@@ -518,38 +436,3 @@ fn set_interactive_priority() {
 
 #[cfg(not(target_os = "macos"))]
 fn set_interactive_priority() {}
-
-fn expand(rect: [f32; 4], factor: f32, max_w: f32, max_h: f32) -> [f32; 4] {
-    let cx = (rect[0] + rect[2]) / 2.0;
-    let cy = (rect[1] + rect[3]) / 2.0;
-    let w = (rect[2] - rect[0]) * (1.0 + factor);
-    let h = (rect[3] - rect[1]) * (1.0 + factor);
-    let side = w.max(h);
-    [
-        (cx - side / 2.0).max(0.0),
-        (cy - side / 2.0).max(0.0),
-        (cx + side / 2.0).min(max_w),
-        (cy + side / 2.0).min(max_h),
-    ]
-}
-
-fn nms(candidates: &[(f32, [f32; 4])], thresh: f32) -> Vec<(f32, [f32; 4])> {
-    let mut kept = Vec::new();
-    for (conf, b) in candidates {
-        if kept.iter().all(|(_, k)| iou(b, k) <= thresh) {
-            kept.push((*conf, *b));
-        }
-    }
-    kept
-}
-
-fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
-    let xx1 = a[0].max(b[0]);
-    let yy1 = a[1].max(b[1]);
-    let xx2 = a[2].min(b[2]);
-    let yy2 = a[3].min(b[3]);
-    let inter = (xx2 - xx1).max(0.0) * (yy2 - yy1).max(0.0);
-    let area_a = (a[2] - a[0]) * (a[3] - a[1]);
-    let area_b = (b[2] - b[0]) * (b[3] - b[1]);
-    inter / (area_a + area_b - inter)
-}

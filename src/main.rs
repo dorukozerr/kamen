@@ -320,7 +320,7 @@ impl App {
         let Some(result) = &self.track_result else {
             return (WARN, "Starting tracking…".into());
         };
-        if result.head.is_none() {
+        if result.face.is_none() {
             return (WARN, "No face in view".into());
         }
         if self.face.is_calibrating() {
@@ -688,14 +688,14 @@ impl App {
         let Some(result) = &self.track_result else {
             return;
         };
-        let Some(head) = &result.head else {
+        let Some(face) = &result.face else {
             return;
         };
         let scale = rect.width() / result.frame_w as f32;
         let painter = ui.painter_at(rect);
-        for point in &head.points {
+        for point in &face.points {
             let position = rect.min + egui::vec2(point[0], point[1]) * scale;
-            painter.circle_filled(position, 1.2, ACCENT);
+            painter.circle_filled(position, 0.7, ACCENT);
         }
     }
 }

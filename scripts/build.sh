@@ -1,0 +1,190 @@
+#!/bin/sh
+# Build Kamen for macOS.
+#
+#   scripts/build.sh          Build target/Kamen.app (same as `app`).
+#   scripts/build.sh dmg      Build the app, then target/Kamen-<version>.dmg.
+#   scripts/build.sh syphon   Rebuild the Syphon library.
+#   scripts/build.sh icon     Regenerate assets/AppIcon.* from make-icon.swift.
+#   scripts/build.sh models   Re-convert the MediaPipe models from Google's.
+#
+# `app` and `dmg` are the everyday ones. The other three only matter when
+# their inputs change: `app` builds Syphon itself the first time, and the icon
+# and models are committed.
+set -eu
+cd "$(dirname "$0")/.."
+
+APP=target/Kamen.app
+VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+
+# target/syphon/libSyphon.dylib, from the official Syphon framework source
+# (BSD 2-clause), unmodified, at a pinned commit. Syphon lets Kamen send its
+# frames straight to OBS, with transparency and without window capture.
+#
+# The project's prebuilt SDK is Intel-only, so it is compiled here with clang
+# (Command Line Tools are enough). The Metal classes are left out: they need
+# Xcode's Metal compiler and Kamen draws with OpenGL.
+build_syphon() {
+    repo=https://github.com/Syphon/Syphon-Framework
+    commit=f4761677a45b8034a3c2069ec0f3d2553da81fba
+    out=target/syphon
+    src=$out/src
+
+    mkdir -p "$out"
+    if [ "$(git -C "$src" rev-parse HEAD 2>/dev/null || true)" != "$commit" ]; then
+        rm -rf "$src"
+        git clone -q "$repo" "$src"
+        git -C "$src" checkout -q "$commit"
+    fi
+    # The sources import their own headers as <Syphon/...>.
+    mkdir -p "$out/include"
+    ln -sfn ../src "$out/include/Syphon"
+
+    sources=$(ls "$src"/*.m "$src"/*.c | grep -v Metal)
+    # shellcheck disable=SC2086
+    clang -dynamiclib -arch arm64 -arch x86_64 -mmacosx-version-min=11.0 -O2 \
+        -fobjc-arc -fobjc-weak -include "$src/Syphon_Prefix.pch" \
+        -DSYPHON_CORE_SHARE -DGL_SILENCE_DEPRECATION -w -I"$src" -I"$out/include" \
+        $sources \
+        -framework Cocoa -framework OpenGL -framework IOSurface \
+        -install_name @rpath/libSyphon.dylib \
+        -o "$out/libSyphon.dylib"
+    cp "$src/License.txt" "$out/LICENSE-Syphon.txt"
+    echo "Built $out/libSyphon.dylib"
+}
+
+# assets/AppIcon.png and .icns, drawn by scripts/make-icon.swift.
+build_icon() {
+    set_dir=target/AppIcon.iconset
+    rm -rf "$set_dir"
+    mkdir -p "$set_dir" assets
+    swift scripts/make-icon.swift assets/AppIcon.png
+    for size in 16 32 128 256 512; do
+        double=$((size * 2))
+        sips -z "$size" "$size" assets/AppIcon.png --out "$set_dir/icon_${size}x${size}.png" >/dev/null
+        sips -z "$double" "$double" assets/AppIcon.png --out "$set_dir/icon_${size}x${size}@2x.png" >/dev/null
+    done
+    iconutil -c icns "$set_dir" -o assets/AppIcon.icns
+    echo "Built assets/AppIcon.icns"
+}
+
+# models/mediapipe/*.onnx, converted from Google's official MediaPipe bundle.
+# Needs `uv`. Everything it downloads stays under target/.
+build_models() {
+    work=$PWD/target/mediapipe
+    export UV_CACHE_DIR="$PWD/target/uv-cache" UV_PYTHON_INSTALL_DIR="$PWD/target/uv-python"
+    mkdir -p "$work/tfl/face" models/mediapipe
+
+    curl -sfL -o "$work/face_landmarker.task" \
+        https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task
+    unzip -qo "$work/face_landmarker.task" -d "$work/tfl/face"
+
+    [ -x "$work/venv/bin/python" ] || uv venv -q --python 3.11 "$work/venv"
+    uv pip install -q --python "$work/venv/bin/python" "tensorflow==2.15.*" "tf2onnx==1.16.1" "numpy<2" onnx
+
+    for model in face_detector face_landmarks_detector face_blendshapes; do
+        "$work/venv/bin/python" -m tf2onnx.convert --tflite "$work/tfl/face/$model.tflite" \
+            --output "models/mediapipe/$model.onnx" --opset 17 >"$work/$model.log" 2>&1
+        echo "Converted $model"
+    done
+    (cd models/mediapipe && shasum -a 256 ./*.onnx > SHA256SUMS)
+}
+
+# target/Kamen.app: the app bundle with its icon, metadata, tracking models
+# and the Syphon library, signed for running on this Mac.
+build_app() {
+    cargo build --release
+
+    year=$(date +%Y)
+    rm -rf "$APP"
+    mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/models" "$APP/Contents/Frameworks"
+    cp target/release/kamen "$APP/Contents/MacOS/kamen"
+    cp assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+    cp LICENSE "$APP/Contents/Resources/LICENSE-Kamen.txt"
+    printf 'APPL????' > "$APP/Contents/PkgInfo"
+    # -c clones on APFS, so copies take no extra disk space.
+    cp -cR models/mediapipe "$APP/Contents/Resources/models/"
+    # The avatar loaded at startup, if there is one.
+    if [ -d models/vrm ]; then
+        cp -cR models/vrm "$APP/Contents/Resources/models/"
+    fi
+
+    cat > "$APP/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key><string>Kamen</string>
+    <key>CFBundleDisplayName</key><string>Kamen</string>
+    <key>CFBundleIdentifier</key><string>sh.doruk.kamen</string>
+    <key>CFBundleExecutable</key><string>kamen</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+    <key>CFBundleDevelopmentRegion</key><string>en</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
+    <key>CFBundleSupportedPlatforms</key><array><string>MacOSX</string></array>
+    <key>LSApplicationCategoryType</key><string>public.app-category.video</string>
+    <key>NSHumanReadableCopyright</key><string>© $year Doruk Özer. Free software.</string>
+    <key>NSPrincipalClass</key><string>NSApplication</string>
+    <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+    <key>CFBundleShortVersionString</key><string>$VERSION</string>
+    <key>CFBundleVersion</key><string>$VERSION</string>
+    <key>LSMinimumSystemVersion</key><string>12.0</string>
+    <key>NSHighResolutionCapable</key><true/>
+    <key>NSAppSleepDisabled</key><true/>
+    <key>NSCameraUsageDescription</key><string>Kamen tracks your face with the camera to animate your avatar.</string>
+</dict>
+</plist>
+PLIST
+
+    # Syphon output (optional at run time): built once, shipped in the bundle.
+    [ -f target/syphon/libSyphon.dylib ] || build_syphon
+    cp target/syphon/libSyphon.dylib "$APP/Contents/Frameworks/"
+    cp target/syphon/LICENSE-Syphon.txt "$APP/Contents/Resources/"
+
+    # Signing identity. macOS remembers the camera permission per signature.
+    # The default ad-hoc signature ("-") is derived from the binary itself, so
+    # every rebuild looks like a new app and macOS asks again. A real identity
+    # (a self-signed "Code Signing" certificate, or an Apple Developer ID)
+    # stays the same across rebuilds. Set it in KAMEN_SIGN_IDENTITY, or put
+    # its name in the file .codesign-identity at the project root.
+    identity=${KAMEN_SIGN_IDENTITY:-}
+    if [ -z "$identity" ] && [ -f .codesign-identity ]; then
+        identity=$(head -1 .codesign-identity)
+    fi
+    identity=${identity:--}
+    codesign --force --sign "$identity" "$APP/Contents/Frameworks/libSyphon.dylib"
+    codesign --force --sign "$identity" "$APP"
+    if [ "$identity" = "-" ]; then
+        echo "Built $APP (ad-hoc signature: macOS will ask for the camera again after each rebuild)"
+    else
+        echo "Built $APP (signed as: $identity)"
+    fi
+}
+
+# target/Kamen-<version>.dmg: the app plus a shortcut to Applications, for
+# sharing. Without a Developer ID signature and notarization, macOS blocks
+# the downloaded app until it is allowed in System Settings.
+build_dmg() {
+    build_app
+    stage=target/dmg
+    dmg=target/Kamen-$VERSION.dmg
+    rm -rf "$stage" "$dmg"
+    mkdir -p "$stage"
+    cp -cR "$APP" "$stage/"
+    ln -s /Applications "$stage/Applications"
+    hdiutil create -volname Kamen -srcfolder "$stage" -ov -format UDZO "$dmg" >/dev/null
+    rm -rf "$stage"
+    echo "Built $dmg"
+}
+
+case "${1:-app}" in
+    app) build_app ;;
+    dmg) build_dmg ;;
+    syphon) build_syphon ;;
+    icon) build_icon ;;
+    models) build_models ;;
+    *)
+        sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
+        exit 1
+        ;;
+esac

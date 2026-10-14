@@ -30,7 +30,7 @@ pub fn present_gl_frame() -> bool {
 /// without capturing a window.
 ///
 /// Syphon is loaded at run time from `libSyphon.dylib`, built by
-/// `scripts/build-syphon.sh`; without that file `new` returns an error and
+/// `scripts/build.sh syphon`; without that file `new` returns an error and
 /// the rest of the app is unaffected.
 #[cfg(target_os = "macos")]
 pub struct SyphonServer {
@@ -57,7 +57,7 @@ impl SyphonServer {
             // SAFETY: `dlopen` takes a NUL-terminated path and returns null on failure.
             .any(|path| unsafe { !dlopen(path.as_ptr(), RTLD_NOW).is_null() });
         if !loaded {
-            return Err("Syphon library not found. Run scripts/build-syphon.sh, then rebuild the app.".into());
+            return Err("Syphon library not found. Run scripts/build.sh, which builds it.".into());
         }
         // SAFETY: each message is sent with the signature of the method it
         // names. `-CGLContextObj` returns the context pointer that

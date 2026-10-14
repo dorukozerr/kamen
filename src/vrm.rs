@@ -31,11 +31,9 @@ const BROW_WEIGHT: f32 = 0.6;
 const BROW_LOWER_WEIGHT: f32 = 0.35;
 const FROWN_WEIGHT: f32 = 0.4;
 const SQUINT_WEIGHT: f32 = 0.45;
-/// Eye rotation range in radians, and how much of a head turn the eyes
-/// undo so they keep looking toward the viewer.
-const EYE_MAX_YAW: f32 = 0.14;
-const EYE_MAX_PITCH: f32 = 0.09;
-const EYE_COUNTER: f32 = 0.30;
+/// Eye rotation in radians at full tracked gaze.
+const EYE_MAX_YAW: f32 = 0.30;
+const EYE_MAX_PITCH: f32 = 0.18;
 /// Spine tilt in radians when leaning fully toward the camera.
 const LEAN_ANGLE: f32 = 0.10;
 /// Outline thickness limit in meters. Models thin their outlines with a
@@ -643,10 +641,9 @@ impl VrmAvatar {
                 values.push((format!("Bone: {bone}"), Vec2::new(yaw * share, pitch * share).map(f32::to_degrees)));
             }
         }
-        // Eyes dart a little on their own and turn back against the head, so
-        // the avatar keeps eye contact while its head moves.
-        let eye_yaw = (face.gaze_x * EYE_MAX_YAW - yaw * EYE_COUNTER).clamp(-EYE_MAX_YAW, EYE_MAX_YAW);
-        let eye_pitch = (face.gaze_y * EYE_MAX_PITCH - pitch * EYE_COUNTER).clamp(-EYE_MAX_PITCH, EYE_MAX_PITCH);
+        // Eyes follow the tracked gaze, which is already relative to the head.
+        let eye_yaw = face.gaze_x.clamp(-1.0, 1.0) * EYE_MAX_YAW;
+        let eye_pitch = face.gaze_y.clamp(-1.0, 1.0) * EYE_MAX_PITCH;
         let eye_rotation = Quat::from_euler(EulerRot::YXZ, eye_yaw, eye_pitch, 0.0);
         self.rotate_bone("leftEye", eye_rotation);
         self.rotate_bone("rightEye", eye_rotation);

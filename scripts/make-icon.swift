@@ -1,5 +1,5 @@
 // Draws Kamen's app icon (a white mask on a black tile) and writes a 1024 px PNG.
-// Run through scripts/make-icon.sh, which turns it into assets/AppIcon.icns.
+// Run through `scripts/build.sh icon`, which turns it into assets/AppIcon.icns.
 import AppKit
 
 let side = 1024
