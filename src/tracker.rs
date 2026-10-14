@@ -18,7 +18,6 @@ use ndarray::{Array3, Array4};
 use ort::{session::Session, value::Tensor};
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
-use std::time::Instant;
 
 const MODEL_DIR: &str = "models/mediapipe";
 const DETECTOR_FILE: &str = "face_detector.onnx";
@@ -155,11 +154,7 @@ pub struct BodyResult {
 
 pub struct TrackResult {
     pub frame_w: u32,
-    #[allow(dead_code)]
-    pub frame_h: u32,
     pub face: Option<FaceTrack>,
-    #[allow(dead_code)]
-    pub ms: f32,
 }
 
 /// Channels to the two tracking threads. Send every camera frame to both;
@@ -279,7 +274,6 @@ fn tracker_loop(
         while let Ok(newer) = rx.try_recv() {
             frame = newer;
         }
-        let start = Instant::now();
         let face = Pixels::from_frame(&frame).and_then(|pixels| track(&mut models, &pixels, &mut roi));
         if face.is_none() {
             roi = None;
@@ -296,9 +290,7 @@ fn tracker_loop(
         });
         let _ = tx.send(TrackResult {
             frame_w: frame.width,
-            frame_h: frame.height,
             face,
-            ms: start.elapsed().as_secs_f32() * 1000.0,
         });
     }
 }

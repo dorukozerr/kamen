@@ -2,28 +2,24 @@
 
 /// Swap the window's buffers for the current OpenGL context. eframe owns the
 /// swap but skips it for hidden windows, and doesn't expose the surface, so
-/// this asks AppKit directly. Returns whether a context was current.
+/// this asks AppKit directly.
 #[cfg(target_os = "macos")]
-pub fn present_gl_frame() -> bool {
+pub fn present_gl_frame() {
     // SAFETY: `+[NSOpenGLContext currentContext]` takes no arguments and
     // returns an object or nil; `-flushBuffer` takes none and returns nothing.
     unsafe {
         let Some(class) = objc::class(c"NSOpenGLContext") else {
-            return false;
+            return;
         };
         let context = objc::send_id(class, objc::selector(c"currentContext"));
-        if context.is_null() {
-            return false;
+        if !context.is_null() {
+            objc::send_void(context, objc::selector(c"flushBuffer"));
         }
-        objc::send_void(context, objc::selector(c"flushBuffer"));
-        true
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn present_gl_frame() -> bool {
-    false
-}
+pub fn present_gl_frame() {}
 
 /// A Syphon server: publishes frames to other apps on this Mac (OBS's
 /// "Syphon Client" source) through shared GPU memory, with transparency and

@@ -7,17 +7,16 @@ authors = ["Doruk Özer"]
 license = "WTFPL"
 
 [dependencies]
-cameras = { version = "0.3.2", features = ["analysis", "controls"] }
+cameras = "0.3.2"
 eframe = { version = "0.34", features = ["glow"] }
 egui = "0.34.3"
-egui-cameras = { version = "0.3.2", features = ["discover"] }
+egui-cameras = "0.3.2"
 glam = "0.29"
 glow = "0.17"
 gltf = { version = "1.4.1", default-features = false, features = ["utils", "names"] }
 image = "0.25.10"
-ipnet = "2.12.2"
 ndarray = "0.17.2"
-ort = { version = "2.0.0-rc.14", features = ["coreml"] }
+ort = "2.0.0-rc.14"
 rfd = "0.17.2"
 serde_json = "1.0.154"
 

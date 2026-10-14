@@ -1,2 +1,6 @@
 target
 .codesign-identity
+
+# Raw screen recordings; only the compressed demo/kamen-demo.mp4 is committed.
+demo/*.mov
+.DS_Store

@@ -245,31 +245,4 @@ impl RenderTarget {
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
         }
     }
-
-    /// Read the current frame back as top-down RGBA (premultiplied alpha).
-    #[allow(dead_code)]
-    pub fn read_rgba(&self, gl: &glow::Context) -> Vec<u8> {
-        let [w, h] = [self.size[0] as usize, self.size[1] as usize];
-        let mut pixels = vec![0u8; w * h * 4];
-        unsafe {
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.framebuffer));
-            gl.read_pixels(
-                0,
-                0,
-                w as i32,
-                h as i32,
-                glow::RGBA,
-                glow::UNSIGNED_BYTE,
-                glow::PixelPackData::Slice(Some(&mut pixels)),
-            );
-            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-        }
-        // GL rows are bottom-up.
-        pixels
-            .chunks_exact(w * 4)
-            .rev()
-            .flatten()
-            .copied()
-            .collect()
-    }
 }

@@ -36,7 +36,11 @@ const PREVIEW_MAX_WIDTH: usize = 1280;
 const AVATAR_MAX_RENDER_SIDE: f32 = 1600.0;
 
 /// Where the Donate button leads.
-const DONATE_URL: &str = "https://doruk.wtf";
+// Donations are switched off for now; see the commented-out section in
+// `sidebar`.
+// const DONATE_URL: &str = "https://doruk.wtf";
+/// The project's source code.
+const GITHUB_URL: &str = "https://github.com/dorukozerr/kamen";
 
 const SIDEBAR_WIDTH: f32 = 272.0;
 const CANVAS: egui::Color32 = egui::Color32::from_rgb(24, 25, 29);
@@ -155,7 +159,6 @@ struct App {
     /// Show the camera picture in the sidebar. Off by default: converting
     /// and uploading camera frames costs more than the tracking itself.
     show_preview: bool,
-    track_flag: Arc<AtomicBool>,
     /// Whether the camera preview is on screen; the camera thread skips
     /// converting frames for it otherwise.
     preview_flag: Arc<AtomicBool>,
@@ -167,7 +170,6 @@ struct App {
     body_rx: Option<mpsc::Receiver<tracker::BodyResult>>,
     body_result: Option<tracker::BodyResult>,
     body: body::BodySolver,
-    camera_fps: FpsCounter,
     track_fps: FpsCounter,
     face: face::FaceSolver,
 
@@ -189,9 +191,6 @@ struct App {
     syphon_enabled: bool,
     syphon: Option<platform::SyphonServer>,
     syphon_error: Option<String>,
-    hidden_log: HiddenLog,
-    /// The window was hidden on the last frame (for logging the change).
-    presenting_hidden: bool,
 }
 
 impl App {
@@ -204,7 +203,6 @@ impl App {
             stream: None,
             camera_error: None,
             show_preview: false,
-            track_flag: Arc::new(AtomicBool::new(true)),
             preview_flag: Arc::new(AtomicBool::new(false)),
             tracker_rx: None,
             body_flag: Arc::new(AtomicBool::new(true)),
@@ -212,7 +210,6 @@ impl App {
             body_result: None,
             body: body::BodySolver::default(),
             track_result: None,
-            camera_fps: FpsCounter::default(),
             track_fps: FpsCounter::default(),
             face,
             avatar: None,
@@ -226,8 +223,6 @@ impl App {
             syphon_enabled: true,
             syphon: None,
             syphon_error: None,
-            hidden_log: HiddenLog::default(),
-            presenting_hidden: false,
         }
     }
 
@@ -255,10 +250,8 @@ impl App {
                 let trackers = tracker::spawn_trackers();
                 self.stream = Some(spawn_stream(
                     camera,
-                    [
-                        (trackers.face_frames, self.track_flag.clone()),
-                        (trackers.body_frames, self.body_flag.clone()),
-                    ],
+                    trackers.face_frames,
+                    (trackers.body_frames, self.body_flag.clone()),
                     self.preview_flag.clone(),
                 ));
                 self.tracker_rx = Some(trackers.face_results);
@@ -483,9 +476,7 @@ impl App {
         }
         let window = ctx.content_rect().size() * ctx.pixels_per_point();
         target.blit_to_window(&gl, [window.x.round() as u32, window.y.round() as u32]);
-        self.hidden_log.before_present();
-        let presented = platform::present_gl_frame();
-        self.hidden_log.frame(presented);
+        platform::present_gl_frame();
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
@@ -668,17 +659,27 @@ impl App {
             },
         );
 
-        section(ui, "Support");
-        hint(
-            ui,
-            "Kamen is free. If it's useful to you, a donation helps keep it going.",
-        );
+        // section(ui, "Support");
+        // hint(
+        //     ui,
+        //     "Kamen is free. If it's useful to you, a donation helps keep it going.",
+        // );
+        // if ui
+        //     .add_sized([ui.available_width(), 28.0], egui::Button::new("Donate"))
+        //     .on_hover_text(DONATE_URL)
+        //     .clicked()
+        // {
+        //     ui.ctx().open_url(egui::OpenUrl::new_tab(DONATE_URL));
+        // }
+
+        section(ui, "About");
+        hint(ui, "Kamen is free and open source.");
         if ui
-            .add_sized([ui.available_width(), 28.0], egui::Button::new("Donate"))
-            .on_hover_text(DONATE_URL)
+            .add_sized([ui.available_width(), 28.0], egui::Button::new("Source code on GitHub"))
+            .on_hover_text(GITHUB_URL)
             .clicked()
         {
-            ui.ctx().open_url(egui::OpenUrl::new_tab(DONATE_URL));
+            ui.ctx().open_url(egui::OpenUrl::new_tab(GITHUB_URL));
         }
 
         ui.add_space(12.0);
@@ -743,10 +744,8 @@ impl eframe::App for App {
     /// Runs every frame, also while the window is hidden (covered, or on
     /// another Space), when eframe skips `ui` and painting.
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        if let Some(stream) = &mut self.stream
-            && update_texture(stream, ctx)
-        {
-            self.camera_fps.tick();
+        if let Some(stream) = &mut self.stream {
+            update_texture(stream, ctx);
         }
         if let Some(rx) = &self.tracker_rx {
             while let Ok(result) = rx.try_recv() {
@@ -772,21 +771,9 @@ impl eframe::App for App {
         );
         self.update_syphon();
         if hidden && (self.avatar_only || self.syphon.is_some()) {
-            if !self.presenting_hidden {
-                self.presenting_hidden = true;
-                self.hidden_log
-                    .note("hidden: drawing the avatar directly (controls hidden, or Syphon)");
-            }
             self.present_while_hidden(ctx, frame);
             // `ui` isn't running to ask for the next frame.
             ctx.request_repaint_after(self.frame_interval());
-        } else if hidden != self.presenting_hidden {
-            self.presenting_hidden = hidden;
-            self.hidden_log.note(if hidden {
-                "hidden, with controls showing and Syphon off: nothing is drawn"
-            } else {
-                "visible again"
-            });
         }
     }
 
@@ -875,16 +862,16 @@ struct CameraStream {
 
 fn spawn_stream(
     camera: Camera,
-    trackers: [(mpsc::Sender<cameras::Frame>, Arc<AtomicBool>); 2],
+    face_frames: mpsc::Sender<cameras::Frame>,
+    body_frames: (mpsc::Sender<cameras::Frame>, Arc<AtomicBool>),
     preview: Arc<AtomicBool>,
 ) -> CameraStream {
     let latest = Arc::new(Mutex::new(None));
     let slot = latest.clone();
     let pump = cameras::pump::spawn(camera, move |frame| {
-        for (sender, enabled) in &trackers {
-            if enabled.load(Ordering::Relaxed) {
-                let _ = sender.send(frame.clone());
-            }
+        let _ = face_frames.send(frame.clone());
+        if body_frames.1.load(Ordering::Relaxed) {
+            let _ = body_frames.0.send(frame.clone());
         }
         if preview.load(Ordering::Relaxed)
             && let Some(image) = frame_to_color_image(&frame)
@@ -931,15 +918,15 @@ fn frame_to_color_image(frame: &cameras::Frame) -> Option<egui::ColorImage> {
     Some(egui::ColorImage::new([out_width, out_height], pixels))
 }
 
-/// Upload the newest converted frame, if any. Returns whether one was uploaded.
-fn update_texture(stream: &mut CameraStream, ctx: &egui::Context) -> bool {
+/// Upload the newest converted frame, if any.
+fn update_texture(stream: &mut CameraStream, ctx: &egui::Context) {
     let Some(image) = stream
         .latest
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .take()
     else {
-        return false;
+        return;
     };
     match &mut stream.texture {
         Some(texture) => texture.set(image, egui::TextureOptions::LINEAR),
@@ -948,7 +935,6 @@ fn update_texture(stream: &mut CameraStream, ctx: &egui::Context) -> bool {
                 Some(ctx.load_texture("camera-frame", image, egui::TextureOptions::LINEAR));
         }
     }
-    true
 }
 
 /// The default avatar's location, if the file exists: inside the app bundle
@@ -967,53 +953,6 @@ fn default_avatar_path() -> Option<std::path::PathBuf> {
         .into_iter()
         .chain([std::path::PathBuf::from(DEFAULT_AVATAR)])
         .find(|path| path.exists())
-}
-
-/// Diagnostic for the hidden-window path: once a second while the window is
-/// hidden, appends how many frames were drawn to `kamen-hidden.log` in the
-/// temp directory. An app opened from Finder has no terminal to print to.
-#[derive(Default)]
-struct HiddenLog {
-    window_start: Option<Instant>,
-    frames: u32,
-    presented: u32,
-}
-
-impl HiddenLog {
-    fn note(&self, text: &str) {
-        use std::io::Write;
-        let path = std::env::temp_dir().join("kamen-hidden.log");
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            let _ = writeln!(file, "{} {text}", unix_timestamp());
-        }
-    }
-
-    /// Call right before presenting. Once a second this leaves a marker, so a
-    /// present call that never returns shows up as a marker with no summary.
-    fn before_present(&mut self) {
-        if self.window_start.is_none() {
-            self.window_start = Some(Instant::now());
-            self.note("presenting...");
-        }
-    }
-
-    fn frame(&mut self, presented: bool) {
-        let start = *self.window_start.get_or_insert_with(Instant::now);
-        self.frames += 1;
-        self.presented += presented as u32;
-        if start.elapsed() < Duration::from_secs(1) {
-            return;
-        }
-        self.note(&format!(
-            "hidden frames drawn={} presented={}",
-            self.frames, self.presented
-        ));
-        *self = Self::default();
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -1047,11 +986,4 @@ impl FpsCounter {
             self.window_start = Some(now);
         }
     }
-}
-
-fn unix_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
