@@ -1,4 +1,5 @@
 mod avatar;
+mod body;
 mod face;
 mod platform;
 mod tracker;
@@ -160,6 +161,12 @@ struct App {
     preview_flag: Arc<AtomicBool>,
     tracker_rx: Option<mpsc::Receiver<tracker::TrackResult>>,
     track_result: Option<tracker::TrackResult>,
+    /// Arms and hands: send frames to the body tracker. Costs about as much
+    /// CPU again as face tracking.
+    body_flag: Arc<AtomicBool>,
+    body_rx: Option<mpsc::Receiver<tracker::BodyResult>>,
+    body_result: Option<tracker::BodyResult>,
+    body: body::BodySolver,
     camera_fps: FpsCounter,
     track_fps: FpsCounter,
     face: face::FaceSolver,
@@ -200,6 +207,10 @@ impl App {
             track_flag: Arc::new(AtomicBool::new(true)),
             preview_flag: Arc::new(AtomicBool::new(false)),
             tracker_rx: None,
+            body_flag: Arc::new(AtomicBool::new(true)),
+            body_rx: None,
+            body_result: None,
+            body: body::BodySolver::default(),
             track_result: None,
             camera_fps: FpsCounter::default(),
             track_fps: FpsCounter::default(),
@@ -233,20 +244,25 @@ impl App {
         self.stream = None;
         self.tracker_rx = None;
         self.track_result = None;
+        self.body_rx = None;
+        self.body_result = None;
         let Some(device) = self.devices.get(self.selected_device).cloned() else {
             self.camera_error = Some("No camera found".into());
             return;
         };
         match cameras::open_source(CameraSource::Usb(device), STREAM_CONFIG) {
             Ok(camera) => {
-                let (tracker_tx, tracker_rx) = tracker::spawn_tracker();
+                let trackers = tracker::spawn_trackers();
                 self.stream = Some(spawn_stream(
                     camera,
-                    tracker_tx,
-                    self.track_flag.clone(),
+                    [
+                        (trackers.face_frames, self.track_flag.clone()),
+                        (trackers.body_frames, self.body_flag.clone()),
+                    ],
                     self.preview_flag.clone(),
                 ));
-                self.tracker_rx = Some(tracker_rx);
+                self.tracker_rx = Some(trackers.face_results);
+                self.body_rx = Some(trackers.body_results);
                 self.camera_error = None;
             }
             Err(error) => self.camera_error = Some(format!("Camera: {error}")),
@@ -400,7 +416,7 @@ impl App {
                 }
             },
         };
-        if let Err(error) = avatar.render(&gl, target, [0.0; 4], &self.face.state) {
+        if let Err(error) = avatar.render(&gl, target, [0.0; 4], &self.face.state, &self.body.state) {
             self.avatar_error = Some(format!("Avatar render: {error}"));
             self.avatar = None;
             return;
@@ -449,7 +465,7 @@ impl App {
         // background), so the window itself doesn't need drawing.
         if let Some(server) = &self.syphon {
             if avatar
-                .render(&gl, target, [0.0; 4], &self.face.state)
+                .render(&gl, target, [0.0; 4], &self.face.state, &self.body.state)
                 .is_ok()
             {
                 target.publish_syphon(&gl, server);
@@ -462,7 +478,7 @@ impl App {
             Background::Color(color) => color.to_normalized_gamma_f32(),
             Background::Image => [0.0, 0.0, 0.0, 1.0],
         };
-        if avatar.render(&gl, target, clear, &self.face.state).is_err() {
+        if avatar.render(&gl, target, clear, &self.face.state, &self.body.state).is_err() {
             return;
         }
         let window = ctx.content_rect().size() * ctx.pixels_per_point();
@@ -553,6 +569,13 @@ impl App {
 
         section(ui, "Tracking");
         switch_row(ui, "Mirror", &mut self.face.mirror);
+        let mut body = self.body_flag.load(Ordering::Relaxed);
+        if switch_row(ui, "Arms and hands", &mut body)
+            .on_hover_text("Tracks your arms and hands when they're in view. Uses more CPU.")
+            .changed()
+        {
+            self.body_flag.store(body, Ordering::Relaxed);
+        }
         let calibrate = if self.face.is_calibrating() {
             "Calibrating…"
         } else {
@@ -688,14 +711,30 @@ impl App {
         let Some(result) = &self.track_result else {
             return;
         };
-        let Some(face) = &result.face else {
-            return;
-        };
         let scale = rect.width() / result.frame_w as f32;
         let painter = ui.painter_at(rect);
-        for point in &face.points {
-            let position = rect.min + egui::vec2(point[0], point[1]) * scale;
-            painter.circle_filled(position, 0.7, ACCENT);
+        let dot = |point: [f32; 2], radius: f32, color: egui::Color32| {
+            painter.circle_filled(rect.min + egui::vec2(point[0], point[1]) * scale, radius, color);
+        };
+        if let Some(face) = &result.face {
+            for point in &face.points {
+                dot([point[0], point[1]], 0.7, ACCENT);
+            }
+        }
+        let Some(body) = &self.body_result else {
+            return;
+        };
+        if let Some(pose) = &body.pose {
+            for (point, visibility) in pose.points.iter().zip(&pose.visibility) {
+                if *visibility > 0.5 {
+                    dot(*point, 2.0, GOOD);
+                }
+            }
+        }
+        for hand in body.hands.iter().flatten() {
+            for point in &hand.points {
+                dot(*point, 1.5, WARN);
+            }
         }
     }
 }
@@ -717,6 +756,14 @@ impl eframe::App for App {
             }
         }
         self.face.advance();
+        if let Some(rx) = &self.body_rx {
+            while let Ok(result) = rx.try_recv() {
+                self.body.update(&result);
+                self.body_result = Some(result);
+            }
+        }
+        self.body.mirror = self.face.mirror;
+        self.body.advance();
 
         let hidden = ctx.input(|i| i.viewport().occluded == Some(true));
         self.preview_flag.store(
@@ -828,15 +875,16 @@ struct CameraStream {
 
 fn spawn_stream(
     camera: Camera,
-    tracker_tx: mpsc::Sender<cameras::Frame>,
-    track: Arc<AtomicBool>,
+    trackers: [(mpsc::Sender<cameras::Frame>, Arc<AtomicBool>); 2],
     preview: Arc<AtomicBool>,
 ) -> CameraStream {
     let latest = Arc::new(Mutex::new(None));
     let slot = latest.clone();
     let pump = cameras::pump::spawn(camera, move |frame| {
-        if track.load(Ordering::Relaxed) {
-            let _ = tracker_tx.send(frame.clone());
+        for (sender, enabled) in &trackers {
+            if enabled.load(Ordering::Relaxed) {
+                let _ = sender.send(frame.clone());
+            }
         }
         if preview.load(Ordering::Relaxed)
             && let Some(image) = frame_to_color_image(&frame)

@@ -6,12 +6,18 @@
 //! landmark model places 478 3D points on a rotated crop around it, and the
 //! blendshape model turns a subset of those points into 52 expression values.
 //! While the face stays in view, the next crop comes from the landmarks.
+//!
+//! A second thread tracks the body and hands with MediaPipe's Pose and Hand
+//! Landmarker models, following MediaPipe Holistic: the body crop comes from
+//! the previous frame's pose (or, at first, from the face, since the pose
+//! detector model couldn't be converted), and each hand's crop from the pose's
+//! wrist and finger points, then from the hand's own landmarks.
 
 use cameras::PixelFormat;
 use ndarray::{Array3, Array4};
 use ort::{session::Session, value::Tensor};
 use std::borrow::Cow;
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::Instant;
 
 const MODEL_DIR: &str = "models/mediapipe";
@@ -34,6 +40,57 @@ const LAND_PRESENCE: &str = "Identity_1";
 pub const LANDMARK_COUNT: usize = 478;
 const MIN_PRESENCE: f32 = 0.5;
 
+// Pose Landmarker (lite) and Hand Landmarker models. Inputs are RGB 0..1;
+// output order and meaning follow MediaPipe's
+// modules/pose_landmark/tensors_to_pose_landmarks_and_segmentation.pbtxt and
+// modules/hand_landmark/hand_landmark_cpu.pbtxt.
+const POSE_FILE: &str = "pose_landmarks_detector.onnx";
+const POSE_SIZE: usize = 256;
+const POSE_INPUT: &str = "input_1";
+/// 39 points x (x, y, z, visibility logit, presence logit), in crop pixels:
+/// 33 body landmarks, then auxiliary points used to place the next crop.
+const POSE_POINTS: &str = "Identity";
+/// Pose presence, already 0..1.
+const POSE_FLAG: &str = "Identity_1";
+/// 39 x (x, y, z) in meters, origin between the hips, camera-aligned axes.
+const POSE_WORLD: &str = "Identity_4";
+const POSE_ALL_POINTS: usize = 39;
+pub const POSE_POINT_COUNT: usize = 33;
+/// Auxiliary points: the body center, and a point that sets the crop's size
+/// and rotation (modules/pose_landmark/pose_landmarks_to_roi.pbtxt).
+const POSE_ALIGN_CENTER: usize = 33;
+const POSE_ALIGN_SCALE: usize = 34;
+const POSE_ROI_SCALE: f32 = 1.25;
+/// The first body crop, placed from the face: the body's center (between
+/// the hips) and a point above the head, in face heights from between the
+/// eyes. Rough adult proportions; later crops come from the pose itself.
+const BODY_CENTER_BELOW_EYES: f32 = 4.0;
+const BODY_TOP_ABOVE_EYES: f32 = 1.1;
+
+const HAND_FILE: &str = "hand_landmarks_detector.onnx";
+const HAND_SIZE: usize = 224;
+const HAND_INPUT: &str = "input_1";
+/// 21 x (x, y, z) in crop pixels.
+const HAND_POINTS: &str = "Identity";
+/// Hand presence, already 0..1.
+const HAND_FLAG: &str = "Identity_1";
+/// 21 x (x, y, z) in meters around the hand's center, camera-aligned axes.
+const HAND_WORLD: &str = "Identity_3";
+pub const HAND_POINT_COUNT: usize = 21;
+/// A hand crop from the pose (modules/holistic_landmark/
+/// hand_landmarks_from_pose_to_recrop_roi.pbtxt), and from the hand's own
+/// landmarks (modules/hand_landmark/hand_landmark_landmarks_to_roi.pbtxt).
+const HAND_FROM_POSE_SCALE: f32 = 2.7;
+const HAND_FROM_LANDMARKS_SCALE: f32 = 2.0;
+const HAND_SHIFT_Y: f32 = -0.1;
+/// Hand landmarks MediaPipe uses for the next crop: the wrist and the base
+/// two joints of each finger.
+const HAND_ROI_POINTS: [usize; 12] = [0, 1, 2, 3, 5, 6, 9, 10, 13, 14, 17, 18];
+/// Pose points for each of the person's hands: wrist, pinky, index.
+const POSE_HAND_POINTS: [[usize; 3]; 2] = [[15, 17, 19], [16, 18, 20]];
+/// A wrist must be at least this visible before a hand crop is placed on it.
+const MIN_WRIST_VISIBILITY: f32 = 0.5;
+
 const BLEND_INPUT: &str = "serving_default_input_points:0";
 const BLEND_OUTPUT: &str = "StatefulPartitionedCall:0";
 pub const BLENDSHAPE_COUNT: usize = 52;
@@ -43,6 +100,8 @@ const ROI_SCALE: f32 = 1.5;
 /// Landmarks that set the crop's rotation: the outer corners of the eyes.
 const EYE_OUTER_IMAGE_LEFT: usize = 33;
 const EYE_OUTER_IMAGE_RIGHT: usize = 263;
+const FOREHEAD: usize = 10;
+const CHIN: usize = 152;
 /// The crop holds still unless the face moved by this fraction of its size,
 /// grew or shrank by this fraction, or turned by this angle. A crop that
 /// follows every pixel of landmark noise feeds that noise back in.
@@ -69,6 +128,31 @@ pub struct FaceTrack {
     pub blendshapes: [f32; BLENDSHAPE_COUNT],
 }
 
+/// A tracked body: MediaPipe's 33 pose landmarks.
+pub struct PoseTrack {
+    /// In frame pixels.
+    pub points: Vec<[f32; 2]>,
+    /// In meters, origin between the hips, x right / y down / z away from
+    /// the camera, as seen in the image.
+    pub world: Vec<[f32; 3]>,
+    /// How likely each point is visible in the frame, 0..1.
+    pub visibility: Vec<f32>,
+}
+
+/// A tracked hand: MediaPipe's 21 hand landmarks.
+pub struct HandTrack {
+    /// In frame pixels.
+    pub points: Vec<[f32; 2]>,
+    /// In meters around the hand's center, axes as in `PoseTrack::world`.
+    pub world: Vec<[f32; 3]>,
+}
+
+pub struct BodyResult {
+    pub pose: Option<PoseTrack>,
+    /// The person's own left hand first, then their right.
+    pub hands: [Option<HandTrack>; 2],
+}
+
 pub struct TrackResult {
     pub frame_w: u32,
     #[allow(dead_code)]
@@ -78,14 +162,45 @@ pub struct TrackResult {
     pub ms: f32,
 }
 
-pub fn spawn_tracker() -> (mpsc::Sender<cameras::Frame>, mpsc::Receiver<TrackResult>) {
-    let (frame_tx, frame_rx) = mpsc::channel::<cameras::Frame>();
-    let (result_tx, result_rx) = mpsc::channel::<TrackResult>();
+/// Channels to the two tracking threads. Send every camera frame to both;
+/// each thread skips to the newest frame it has when it's ready.
+pub struct Trackers {
+    pub face_frames: mpsc::Sender<cameras::Frame>,
+    pub face_results: mpsc::Receiver<TrackResult>,
+    pub body_frames: mpsc::Sender<cameras::Frame>,
+    pub body_results: mpsc::Receiver<BodyResult>,
+}
+
+/// Where the face is, shared from the face thread so the body thread can
+/// place its first crop.
+#[derive(Clone, Copy)]
+struct FaceBox {
+    /// Between the eyes, in frame pixels.
+    cx: f32,
+    cy: f32,
+    /// Forehead to chin, in frame pixels.
+    height: f32,
+}
+
+type FaceBoxSlot = Arc<Mutex<Option<FaceBox>>>;
+
+pub fn spawn_trackers() -> Trackers {
+    let (face_frames, face_frame_rx) = mpsc::channel::<cameras::Frame>();
+    let (face_result_tx, face_results) = mpsc::channel::<TrackResult>();
+    let (body_frames, body_frame_rx) = mpsc::channel::<cameras::Frame>();
+    let (body_result_tx, body_results) = mpsc::channel::<BodyResult>();
+    // ONNX Runtime allows one environment per process, so the face thread
+    // loads every model and hands the body models to the body thread.
     std::thread::Builder::new()
         .name("face-tracker".into())
-        .spawn(move || tracker_loop(frame_rx, result_tx))
+        .spawn(move || tracker_loop(face_frame_rx, face_result_tx, body_frame_rx, body_result_tx))
         .expect("spawn face tracker");
-    (frame_tx, result_rx)
+    Trackers {
+        face_frames,
+        face_results,
+        body_frames,
+        body_results,
+    }
 }
 
 /// Models live in `Contents/Resources` when running from a macOS .app bundle
@@ -132,11 +247,32 @@ struct Models {
     anchors: Vec<[f32; 2]>,
 }
 
-fn tracker_loop(rx: mpsc::Receiver<cameras::Frame>, tx: mpsc::Sender<TrackResult>) {
+struct BodyModels {
+    pose: Session,
+    hand: Session,
+}
+
+fn tracker_loop(
+    rx: mpsc::Receiver<cameras::Frame>,
+    tx: mpsc::Sender<TrackResult>,
+    body_rx: mpsc::Receiver<cameras::Frame>,
+    body_tx: mpsc::Sender<BodyResult>,
+) {
     set_interactive_priority();
-    let Some(mut models) = load_models() else {
+    let Some((mut models, body_models)) = load_models() else {
         return;
     };
+    let face_box: FaceBoxSlot = Arc::new(Mutex::new(None));
+    match body_models {
+        Some(body_models) => {
+            let face_box = face_box.clone();
+            std::thread::Builder::new()
+                .name("body-tracker".into())
+                .spawn(move || body_loop(body_models, body_rx, body_tx, face_box))
+                .expect("spawn body tracker");
+        }
+        None => eprintln!("body tracker: models missing, tracking the face only"),
+    }
     let mut roi: Option<Roi> = None;
 
     while let Ok(mut frame) = rx.recv() {
@@ -148,6 +284,16 @@ fn tracker_loop(rx: mpsc::Receiver<cameras::Frame>, tx: mpsc::Sender<TrackResult
         if face.is_none() {
             roi = None;
         }
+        *face_box.lock().unwrap_or_else(PoisonError::into_inner) = face.as_ref().map(|face| {
+            let point = |index: usize| face.points[index];
+            let (a, b) = (point(EYE_OUTER_IMAGE_LEFT), point(EYE_OUTER_IMAGE_RIGHT));
+            let (top, chin) = (point(FOREHEAD), point(CHIN));
+            FaceBox {
+                cx: (a[0] + b[0]) / 2.0,
+                cy: (a[1] + b[1]) / 2.0,
+                height: (top[0] - chin[0]).hypot(top[1] - chin[1]),
+            }
+        });
         let _ = tx.send(TrackResult {
             frame_w: frame.width,
             frame_h: frame.height,
@@ -157,7 +303,8 @@ fn tracker_loop(rx: mpsc::Receiver<cameras::Frame>, tx: mpsc::Sender<TrackResult
     }
 }
 
-fn load_models() -> Option<Models> {
+/// The face models, and the body models if they load too.
+fn load_models() -> Option<(Models, Option<BodyModels>)> {
     let environment = ort::init()
         .build()
         .inspect_err(|error| eprintln!("face tracker: onnxruntime init failed: {error}"))
@@ -172,12 +319,19 @@ fn load_models() -> Option<Models> {
             .inspect_err(|error| eprintln!("face tracker: loading {file} failed: {error}"))
             .ok()
     };
-    Some(Models {
+    let models = Models {
         detector: load(DETECTOR_FILE)?,
         landmarks: load(LANDMARKS_FILE)?,
         blendshapes: load(BLENDSHAPES_FILE)?,
         anchors: detector_anchors(),
-    })
+    };
+    let body = (|| {
+        Some(BodyModels {
+            pose: load(POSE_FILE)?,
+            hand: load(HAND_FILE)?,
+        })
+    })();
+    Some((models, body))
 }
 
 /// One frame: find the face if it isn't tracked, place the landmarks, read the
@@ -436,3 +590,228 @@ fn set_interactive_priority() {
 
 #[cfg(not(target_os = "macos"))]
 fn set_interactive_priority() {}
+
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x.clamp(-100.0, 100.0)).exp())
+}
+
+/// A crop centered on `center` whose "up" points from `center` toward
+/// `toward`: MediaPipe's AlignmentPointsRectsCalculator with a 90 degree
+/// target angle, followed by its RectTransformationCalculator.
+fn roi_toward(center: [f32; 2], toward: [f32; 2], size: f32, shift_y: f32) -> Roi {
+    let (dx, dy) = (toward[0] - center[0], toward[1] - center[1]);
+    let angle = dx.atan2(-dy);
+    let (sin, cos) = angle.sin_cos();
+    // Shift along the crop's own down axis, in units of its size.
+    Roi {
+        cx: center[0] - sin * shift_y * size,
+        cy: center[1] + cos * shift_y * size,
+        size,
+        angle,
+    }
+}
+
+fn body_loop(
+    mut models: BodyModels,
+    rx: mpsc::Receiver<cameras::Frame>,
+    tx: mpsc::Sender<BodyResult>,
+    face_box: FaceBoxSlot,
+) {
+    set_interactive_priority();
+    let mut pose_roi: Option<Roi> = None;
+    let mut hand_rois: [Option<Roi>; 2] = [None; 2];
+    while let Ok(mut frame) = rx.recv() {
+        while let Ok(newer) = rx.try_recv() {
+            frame = newer;
+        }
+        let Some(pixels) = Pixels::from_frame(&frame) else {
+            continue;
+        };
+        if pose_roi.is_none() {
+            pose_roi = face_box
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .map(body_roi_from_face);
+        }
+        let pose = pose_roi.and_then(|roi| pose_landmarks(&mut models.pose, &pixels, roi));
+        pose_roi = match &pose {
+            Some((_, next)) => Some(match pose_roi {
+                Some(current) if current.close_to(next) => current,
+                _ => *next,
+            }),
+            None => None,
+        };
+        let pose = pose.map(|(pose, _)| pose);
+
+        let mut hands: [Option<HandTrack>; 2] = [None, None];
+        for side in 0..2 {
+            let roi = hand_rois[side].or_else(|| pose.as_ref().and_then(|pose| hand_roi_from_pose(pose, side)));
+            let hand = roi.and_then(|roi| hand_landmarks(&mut models.hand, &pixels, roi));
+            hand_rois[side] = hand.as_ref().map(|(_, next)| match hand_rois[side] {
+                Some(current) if current.close_to(next) => current,
+                _ => *next,
+            });
+            hands[side] = hand.map(|(hand, _)| hand);
+        }
+        if tx.send(BodyResult { pose, hands }).is_err() {
+            return;
+        }
+    }
+}
+
+/// The first body crop, from the face: centered between the hips, sized to
+/// reach above the head, upright.
+fn body_roi_from_face(face: FaceBox) -> Roi {
+    let center = [face.cx, face.cy + face.height * BODY_CENTER_BELOW_EYES];
+    let top = [face.cx, face.cy - face.height * BODY_TOP_ABOVE_EYES];
+    let reach = (top[1] - center[1]).abs();
+    roi_toward(center, top, 2.0 * reach * POSE_ROI_SCALE, 0.0)
+}
+
+/// Run the pose model on `roi`. Returns the pose and the crop for the next
+/// frame, or `None` if no body is there.
+fn pose_landmarks(session: &mut Session, pixels: &Pixels, roi: Roi) -> Option<(PoseTrack, Roi)> {
+    let mut input = Array4::<f32>::zeros((1, POSE_SIZE, POSE_SIZE, 3));
+    pixels.sample(input.as_slice_mut()?, POSE_SIZE, roi, 0.0, 1.0);
+    let outputs = session
+        .run(ort::inputs![POSE_INPUT => Tensor::from_array(input).ok()?])
+        .ok()?;
+    let (_, flag) = outputs[POSE_FLAG].try_extract_tensor::<f32>().ok()?;
+    if *flag.first()? < MIN_PRESENCE {
+        return None;
+    }
+    let (_, raw) = outputs[POSE_POINTS].try_extract_tensor::<f32>().ok()?;
+    let (_, world) = outputs[POSE_WORLD].try_extract_tensor::<f32>().ok()?;
+    if raw.len() < POSE_ALL_POINTS * 5 || world.len() < POSE_ALL_POINTS * 3 {
+        return None;
+    }
+    let scale = 1.0 / POSE_SIZE as f32;
+    let all: Vec<[f32; 2]> = raw
+        .chunks_exact(5)
+        .take(POSE_ALL_POINTS)
+        .map(|p| roi.to_frame(p[0] * scale, p[1] * scale))
+        .collect();
+    let next = {
+        let (center, toward) = (all[POSE_ALIGN_CENTER], all[POSE_ALIGN_SCALE]);
+        let reach = (toward[0] - center[0]).hypot(toward[1] - center[1]);
+        roi_toward(center, toward, 2.0 * reach * POSE_ROI_SCALE, 0.0)
+    };
+    let pose = PoseTrack {
+        points: all[..POSE_POINT_COUNT].to_vec(),
+        world: rotate_world(&world[..POSE_POINT_COUNT * 3], roi.angle),
+        visibility: raw
+            .chunks_exact(5)
+            .take(POSE_POINT_COUNT)
+            .map(|p| sigmoid(p[3]))
+            .collect(),
+    };
+    Some((pose, next))
+}
+
+/// World landmarks come out in the crop's orientation; turn them back to the
+/// image's (MediaPipe's WorldLandmarkProjectionCalculator).
+fn rotate_world(values: &[f32], angle: f32) -> Vec<[f32; 3]> {
+    let (sin, cos) = angle.sin_cos();
+    values
+        .chunks_exact(3)
+        .map(|p| [p[0] * cos - p[1] * sin, p[0] * sin + p[1] * cos, p[2]])
+        .collect()
+}
+
+/// A hand crop from the pose's wrist, pinky and index points, for one of the
+/// person's hands (0 = left, 1 = right), if the wrist is visible
+/// (MediaPipe's HandDetectionsFromPoseToRectsCalculator).
+fn hand_roi_from_pose(pose: &PoseTrack, side: usize) -> Option<Roi> {
+    let [wrist, pinky, index] = POSE_HAND_POINTS[side];
+    if *pose.visibility.get(wrist)? < MIN_WRIST_VISIBILITY {
+        return None;
+    }
+    let (w, p, i) = (pose.points[wrist], pose.points[pinky], pose.points[index]);
+    let middle = [(2.0 * i[0] + p[0]) / 3.0, (2.0 * i[1] + p[1]) / 3.0];
+    let size = 2.0 * (middle[0] - w[0]).hypot(middle[1] - w[1]);
+    if size < 4.0 {
+        return None;
+    }
+    // Rotation points from the wrist toward the fingers; the crop is
+    // centered on the fingers' base.
+    let roi = roi_toward(middle, [2.0 * middle[0] - w[0], 2.0 * middle[1] - w[1]], size * HAND_FROM_POSE_SCALE, HAND_SHIFT_Y);
+    Some(roi)
+}
+
+/// Run the hand model on `roi`. Returns the hand and the crop for the next
+/// frame, or `None` if no hand is there.
+fn hand_landmarks(session: &mut Session, pixels: &Pixels, roi: Roi) -> Option<(HandTrack, Roi)> {
+    let mut input = Array4::<f32>::zeros((1, HAND_SIZE, HAND_SIZE, 3));
+    pixels.sample(input.as_slice_mut()?, HAND_SIZE, roi, 0.0, 1.0);
+    let outputs = session
+        .run(ort::inputs![HAND_INPUT => Tensor::from_array(input).ok()?])
+        .ok()?;
+    let (_, flag) = outputs[HAND_FLAG].try_extract_tensor::<f32>().ok()?;
+    if *flag.first()? < MIN_PRESENCE {
+        return None;
+    }
+    let (_, raw) = outputs[HAND_POINTS].try_extract_tensor::<f32>().ok()?;
+    let (_, world) = outputs[HAND_WORLD].try_extract_tensor::<f32>().ok()?;
+    if raw.len() < HAND_POINT_COUNT * 3 || world.len() < HAND_POINT_COUNT * 3 {
+        return None;
+    }
+    let scale = 1.0 / HAND_SIZE as f32;
+    let points: Vec<[f32; 2]> = raw
+        .chunks_exact(3)
+        .take(HAND_POINT_COUNT)
+        .map(|p| roi.to_frame(p[0] * scale, p[1] * scale))
+        .collect();
+    let next = hand_roi_from_landmarks(&points);
+    let hand = HandTrack {
+        world: rotate_world(&world[..HAND_POINT_COUNT * 3], roi.angle),
+        points,
+    };
+    Some((hand, next))
+}
+
+/// The next hand crop from the hand's landmarks (MediaPipe's
+/// HandLandmarksToRectCalculator): rotated so the fingers point up, around
+/// the bounding box of the wrist and finger-base points.
+fn hand_roi_from_landmarks(points: &[[f32; 2]]) -> Roi {
+    let wrist = points[0];
+    // Between the index and ring finger bases, averaged with the middle's.
+    let (index, middle, ring) = (points[5], points[9], points[13]);
+    let toward = [
+        ((index[0] + ring[0]) / 2.0 + middle[0]) / 2.0,
+        ((index[1] + ring[1]) / 2.0 + middle[1]) / 2.0,
+    ];
+    let angle = (toward[0] - wrist[0]).atan2(-(toward[1] - wrist[1]));
+    let subset: Vec<[f32; 2]> = HAND_ROI_POINTS.iter().map(|&i| points[i]).collect();
+    let (mut min, mut max) = ([f32::MAX; 2], [f32::MIN; 2]);
+    for p in &subset {
+        for axis in 0..2 {
+            min[axis] = min[axis].min(p[axis]);
+            max[axis] = max[axis].max(p[axis]);
+        }
+    }
+    let center = [(min[0] + max[0]) / 2.0, (min[1] + max[1]) / 2.0];
+    // Bounding box along the hand's own axes.
+    let (sin, cos) = (-angle).sin_cos();
+    let (mut low, mut high) = ([f32::MAX; 2], [f32::MIN; 2]);
+    for p in &subset {
+        let (dx, dy) = (p[0] - center[0], p[1] - center[1]);
+        let upright = [dx * cos - dy * sin, dx * sin + dy * cos];
+        for axis in 0..2 {
+            low[axis] = low[axis].min(upright[axis]);
+            high[axis] = high[axis].max(upright[axis]);
+        }
+    }
+    let local = [(low[0] + high[0]) / 2.0, (low[1] + high[1]) / 2.0];
+    let (sin, cos) = angle.sin_cos();
+    let box_center = [
+        center[0] + local[0] * cos - local[1] * sin,
+        center[1] + local[0] * sin + local[1] * cos,
+    ];
+    let size = (high[0] - low[0]).max(high[1] - low[1]) * HAND_FROM_LANDMARKS_SCALE;
+    Roi {
+        cx: box_center[0] - sin * HAND_SHIFT_Y * size,
+        cy: box_center[1] + cos * HAND_SHIFT_Y * size,
+        size,
+        angle,
+    }
+}

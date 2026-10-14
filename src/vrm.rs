@@ -12,6 +12,7 @@ use glam::{EulerRot, Mat4, Quat, Vec2, Vec3};
 use glow::HasContext;
 use serde_json::Value;
 
+use crate::body::BodyState;
 use crate::face::FaceState;
 
 const MAX_YAW: f32 = 0.70; // radians at head_yaw = 1
@@ -57,6 +58,7 @@ struct Node {
     rotation: Quat,
     world: Mat4,
     rest_world_rotation: Quat,
+    rest_world_position: Vec3,
 }
 
 /// VRM 1.0 node constraint: helper bones (sleeves, twist bones) that follow
@@ -248,6 +250,7 @@ impl VrmAvatar {
                     rotation,
                     world: Mat4::IDENTITY,
                     rest_world_rotation: Quat::IDENTITY,
+                    rest_world_position: Vec3::ZERO,
                 }
             })
             .collect();
@@ -455,6 +458,7 @@ impl VrmAvatar {
         avatar.update_world();
         for node in &mut avatar.nodes {
             node.rest_world_rotation = node.world.to_scale_rotation_translation().1;
+            node.rest_world_position = node.world.w_axis.truncate();
         }
         avatar.skin();
         let (mut low, mut high) = (f32::MAX, f32::MIN);
@@ -609,7 +613,100 @@ impl VrmAvatar {
         }
     }
 
-    fn pose(&mut self, face: &FaceState, values: &mut Vec<(String, Vec2)>) {
+    /// Rest-pose world position of a humanoid bone.
+    fn rest_position(&self, bone: &str) -> Option<Vec3> {
+        self.bones.get(bone).map(|&index| self.nodes[index].rest_world_position)
+    }
+
+    /// Rest-pose direction from `bone` toward `toward`, in world space.
+    fn rest_direction(&self, bone: &str, toward: &str) -> Option<Vec3> {
+        (self.rest_position(toward)? - self.rest_position(bone)?).try_normalize()
+    }
+
+    /// World rotation that takes the bone's rest direction to `target`, blended
+    /// from `resting` by `weight`. Falls back to `resting` without tracking.
+    fn aimed(rest: Option<Vec3>, target: Vec3, resting: Quat, weight: f32) -> Quat {
+        match (rest, target.try_normalize()) {
+            (Some(rest), Some(target)) if weight > 0.0 => resting.slerp(Quat::from_rotation_arc(rest, target), weight),
+            _ => resting,
+        }
+    }
+
+    /// Arms and fingers from body tracking. Each bone gets a world rotation
+    /// on top of its rest pose; `rotate_bone` takes the part not already
+    /// inherited from the parent, `parent⁻¹ * total`.
+    fn pose_arms(&mut self, body: &BodyState, values: &mut Vec<(String, Vec2)>) {
+        // VRM 1.0 names the thumb's first bone "metacarpal"; VRM 0.x calls the
+        // same three bones proximal, intermediate, distal.
+        let thumb = if self.bones.contains_key("leftThumbMetacarpal") {
+            ["ThumbMetacarpal", "ThumbProximal", "ThumbDistal"]
+        } else {
+            ["ThumbProximal", "ThumbIntermediate", "ThumbDistal"]
+        };
+        let fingers = [
+            thumb,
+            ["IndexProximal", "IndexIntermediate", "IndexDistal"],
+            ["MiddleProximal", "MiddleIntermediate", "MiddleDistal"],
+            ["RingProximal", "RingIntermediate", "RingDistal"],
+            ["LittleProximal", "LittleIntermediate", "LittleDistal"],
+        ];
+        for (arm, (side, down)) in body.arms.iter().zip([("left", -ARM_DOWN), ("right", ARM_DOWN)]) {
+            let name = |bone: &str| format!("{side}{bone}");
+            // The arm hangs down at rest; VRM models are stored in a T-pose.
+            let resting = Quat::from_rotation_z(down);
+            let upper = Self::aimed(
+                self.rest_direction(&name("UpperArm"), &name("LowerArm")),
+                arm.upper,
+                resting,
+                arm.upper_weight,
+            );
+            self.rotate_bone(&name("UpperArm"), upper);
+            let lower = Self::aimed(
+                self.rest_direction(&name("LowerArm"), &name("Hand")),
+                arm.lower,
+                upper,
+                arm.lower_weight,
+            );
+            self.rotate_bone(&name("LowerArm"), upper.inverse() * lower);
+            values.push((format!("Arm: {side}"), Vec2::new(arm.upper_weight, arm.lower_weight)));
+
+            // The hand turns its rest palm (wrist to middle finger, index to
+            // little finger) onto the tracked palm.
+            let rest_palm = (|| {
+                Some((
+                    self.rest_direction(&name("Hand"), &name("MiddleProximal"))?,
+                    self.rest_direction(&name("IndexProximal"), &name("LittleProximal"))?,
+                ))
+            })();
+            let hand = match (rest_palm, palm_basis(arm.palm_forward, arm.palm_side)) {
+                (Some((forward, side_axis)), Some(tracked)) if arm.hand_weight > 0.0 => match palm_basis(forward, side_axis) {
+                    Some(rest) => lower.slerp(Quat::from_mat3(&(tracked * rest.transpose())), arm.hand_weight),
+                    None => lower,
+                },
+                _ => lower,
+            };
+            self.rotate_bone(&name("Hand"), lower.inverse() * hand);
+            values.push((format!("Hand: {side}"), Vec2::new(arm.hand_weight, 0.0)));
+
+            for (segments, targets) in fingers.iter().zip(&arm.fingers) {
+                let mut parent = hand;
+                for (index, (segment, target)) in segments.iter().zip(targets).enumerate() {
+                    let bone = name(segment);
+                    // Each segment points at the next; the last continues
+                    // the line from the one before it.
+                    let rest = match segments.get(index + 1) {
+                        Some(next) => self.rest_direction(&bone, &name(next)),
+                        None => self.rest_direction(&name(segments[index - 1]), &bone),
+                    };
+                    let total = Self::aimed(rest, *target, parent, arm.hand_weight);
+                    self.rotate_bone(&bone, parent.inverse() * total);
+                    parent = total;
+                }
+            }
+        }
+    }
+
+    fn pose(&mut self, face: &FaceState, body: &BodyState, values: &mut Vec<(String, Vec2)>) {
         for node in &mut self.nodes {
             node.translation = node.rest_translation;
             node.rotation = node.rest_rotation;
@@ -647,8 +744,7 @@ impl VrmAvatar {
         let eye_rotation = Quat::from_euler(EulerRot::YXZ, eye_yaw, eye_pitch, 0.0);
         self.rotate_bone("leftEye", eye_rotation);
         self.rotate_bone("rightEye", eye_rotation);
-        self.rotate_bone("leftUpperArm", Quat::from_rotation_z(-ARM_DOWN));
-        self.rotate_bone("rightUpperArm", Quat::from_rotation_z(ARM_DOWN));
+        self.pose_arms(body, values);
         if let Some(&hips) = self.bones.get("hips") {
             let parent_rotation = match self.nodes[hips].parent {
                 Some(parent) => self.nodes[parent].rest_world_rotation,
@@ -755,9 +851,10 @@ impl VrmAvatar {
         view_height: f32,
         clear: [f32; 4],
         face: &FaceState,
+        body: &BodyState,
         values: &mut Vec<(String, Vec2)>,
     ) -> Result<(), String> {
-        self.pose(face, values);
+        self.pose(face, body, values);
         self.skin();
         if self.gl.is_none() {
             self.gl = Some(self.create_gl(gl, size)?);
@@ -967,6 +1064,14 @@ impl Msaa {
             gl.framebuffer_renderbuffer(glow::FRAMEBUFFER, glow::DEPTH_ATTACHMENT, glow::RENDERBUFFER, Some(self.depth));
         }
     }
+}
+
+/// Orthonormal basis (forward, side, normal) as matrix columns, from a palm's
+/// forward direction and a direction across it.
+fn palm_basis(forward: Vec3, across: Vec3) -> Option<glam::Mat3> {
+    let forward = forward.try_normalize()?;
+    let side = (across - forward * across.dot(forward)).try_normalize()?;
+    Some(glam::Mat3::from_cols(forward, side, forward.cross(side)))
 }
 
 /// The JSON chunk of a binary glTF: 12-byte header, then length + "JSON" + data.

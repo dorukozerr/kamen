@@ -72,19 +72,27 @@ build_icon() {
 build_models() {
     work=$PWD/target/mediapipe
     export UV_CACHE_DIR="$PWD/target/uv-cache" UV_PYTHON_INSTALL_DIR="$PWD/target/uv-python"
-    mkdir -p "$work/tfl/face" models/mediapipe
-
-    curl -sfL -o "$work/face_landmarker.task" \
-        https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task
-    unzip -qo "$work/face_landmarker.task" -d "$work/tfl/face"
+    mkdir -p models/mediapipe
+    base=https://storage.googleapis.com/mediapipe-models
+    for bundle in face:face_landmarker/face_landmarker hand:hand_landmarker/hand_landmarker \
+        pose:pose_landmarker/pose_landmarker_lite; do
+        name=${bundle%%:*} path=${bundle#*:}
+        mkdir -p "$work/tfl/$name"
+        curl -sfL -o "$work/$name.task" "$base/$path/float16/latest/$(basename "$path").task"
+        unzip -qo "$work/$name.task" -d "$work/tfl/$name"
+    done
 
     [ -x "$work/venv/bin/python" ] || uv venv -q --python 3.11 "$work/venv"
     uv pip install -q --python "$work/venv/bin/python" "tensorflow==2.15.*" "tf2onnx==1.16.1" "numpy<2" onnx
 
-    for model in face_detector face_landmarks_detector face_blendshapes; do
-        "$work/venv/bin/python" -m tf2onnx.convert --tflite "$work/tfl/face/$model.tflite" \
-            --output "models/mediapipe/$model.onnx" --opset 17 >"$work/$model.log" 2>&1
-        echo "Converted $model"
+    # The pose detector isn't converted: it stores sparse weights tf2onnx
+    # can't read. Kamen places the body crop from the face instead.
+    for model in face/face_detector face/face_landmarks_detector face/face_blendshapes \
+        hand/hand_landmarks_detector pose/pose_landmarks_detector; do
+        name=$(basename "$model")
+        "$work/venv/bin/python" -m tf2onnx.convert --tflite "$work/tfl/$model.tflite" \
+            --output "models/mediapipe/$name.onnx" --opset 17 >"$work/$name.log" 2>&1
+        echo "Converted $name"
     done
     (cd models/mediapipe && shasum -a 256 ./*.onnx > SHA256SUMS)
 }

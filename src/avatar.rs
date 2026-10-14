@@ -10,6 +10,7 @@ use std::sync::Arc;
 use glam::Vec2;
 use glow::HasContext;
 
+use crate::body::BodyState;
 use crate::face::FaceState;
 use crate::vrm::VrmAvatar;
 
@@ -98,6 +99,7 @@ impl Avatar {
         target: &RenderTarget,
         clear: [f32; 4],
         face: &FaceState,
+        body: &BodyState,
     ) -> Result<(), String> {
         let view_height = self.units_per_view_height() / self.zoom;
         // Moving the model right/down is moving the camera left/up.
@@ -111,6 +113,7 @@ impl Avatar {
             view_height,
             clear,
             face,
+            body,
             &mut self.values,
         );
         // Leave GL the way egui expects it.
