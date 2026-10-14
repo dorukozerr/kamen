@@ -54,7 +54,8 @@ fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1080.0, 720.0])
-            .with_min_inner_size([640.0, 480.0]),
+            .with_min_inner_size([640.0, 480.0])
+            .with_icon(app_icon()),
         // The avatar renderer draws with OpenGL.
         renderer: eframe::Renderer::Glow,
         // Don't wait for the display when swapping buffers. A window that is
@@ -84,6 +85,20 @@ fn main() -> Result<(), eframe::Error> {
             Ok(Box::new(app))
         }),
     )
+}
+
+/// The app icon, for the Dock and the app switcher. Without it eframe swaps
+/// in its own default icon at launch, replacing the one from the app bundle.
+fn app_icon() -> egui::IconData {
+    let Ok(image) = image::load_from_memory(include_bytes!("../assets/AppIcon.png")) else {
+        return egui::IconData::default();
+    };
+    let image = image.to_rgba8();
+    egui::IconData {
+        width: image.width(),
+        height: image.height(),
+        rgba: image.into_raw(),
+    }
 }
 
 /// Dark, quiet look: one accent color, rounded controls, roomy spacing.
