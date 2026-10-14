@@ -57,9 +57,24 @@ fi
 mkdir -p "$APP/Contents/Frameworks"
 cp target/syphon/libSyphon.dylib "$APP/Contents/Frameworks/"
 cp target/syphon/LICENSE-Syphon.txt "$APP/Contents/Resources/"
-codesign --force --sign - "$APP/Contents/Frameworks/libSyphon.dylib"
 
-# Ad-hoc signature: enough to run locally and to keep the camera permission
-# between launches. Distribution needs a Developer ID and notarization.
-codesign --force --sign - "$APP"
-echo "Built $APP"
+# Signing identity. macOS remembers the camera permission per signature. The
+# default ad-hoc signature ("-") is derived from the binary itself, so every
+# rebuild looks like a new app and macOS asks again. A real identity (a
+# self-signed "Code Signing" certificate, or an Apple Developer ID) stays the
+# same across rebuilds. Set it in KAMEN_SIGN_IDENTITY, or put its name in the
+# file .codesign-identity at the project root.
+IDENTITY=${KAMEN_SIGN_IDENTITY:-}
+if [ -z "$IDENTITY" ] && [ -f .codesign-identity ]; then
+    IDENTITY=$(head -1 .codesign-identity)
+fi
+IDENTITY=${IDENTITY:--}
+codesign --force --sign "$IDENTITY" "$APP/Contents/Frameworks/libSyphon.dylib"
+
+# Distribution to other people needs a Developer ID and notarization.
+codesign --force --sign "$IDENTITY" "$APP"
+if [ "$IDENTITY" = "-" ]; then
+    echo "Built $APP (ad-hoc signature: macOS will ask for the camera again after each rebuild)"
+else
+    echo "Built $APP (signed as: $IDENTITY)"
+fi
