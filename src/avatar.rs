@@ -98,6 +98,7 @@ impl Avatar {
         gl: &Arc<glow::Context>,
         target: &RenderTarget,
         clear: [f32; 4],
+        background: Option<&Arc<image::RgbaImage>>,
         face: &FaceState,
         body: &BodyState,
     ) -> Result<(), String> {
@@ -112,6 +113,7 @@ impl Avatar {
             center,
             view_height,
             clear,
+            background,
             face,
             body,
             &mut self.values,

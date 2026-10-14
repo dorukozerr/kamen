@@ -185,7 +185,7 @@ pub fn disable_app_nap() {}
 /// The few Objective-C runtime calls used above. `objc_msgSend` has to be
 /// called through a function pointer with the exact signature of the method.
 #[cfg(target_os = "macos")]
-mod objc {
+pub(crate) mod objc {
     use std::ffi::{CStr, c_char, c_void};
 
     pub type Id = *mut c_void;
@@ -200,6 +200,12 @@ mod objc {
     pub unsafe fn class(name: &CStr) -> Option<Id> {
         let class = unsafe { objc_getClass(name.as_ptr()) };
         (!class.is_null()).then_some(class)
+    }
+
+    /// `objc_msgSend`, to be transmuted to the exact signature of the method
+    /// being called.
+    pub fn msg_send() -> unsafe extern "C" fn() {
+        objc_msgSend
     }
 
     pub unsafe fn selector(name: &CStr) -> Id {

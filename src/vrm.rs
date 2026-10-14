@@ -195,6 +195,14 @@ struct GlState {
     white: glow::Texture,
     geometries: Vec<GlGeometry>,
     msaa: Msaa,
+    background_program: glow::Program,
+    u_background_crop: Option<glow::UniformLocation>,
+    /// Core-profile OpenGL needs a vertex array bound even to draw without
+    /// vertex data.
+    background_vao: glow::VertexArray,
+    /// The uploaded background image: which `Arc` it came from, the texture
+    /// and the image size.
+    background: Option<(usize, glow::Texture, [u32; 2])>,
 }
 
 pub struct VrmAvatar {
@@ -850,6 +858,7 @@ impl VrmAvatar {
         center: Vec2,
         view_height: f32,
         clear: [f32; 4],
+        background: Option<&std::sync::Arc<image::RgbaImage>>,
         face: &FaceState,
         body: &BodyState,
         values: &mut Vec<(String, Vec2)>,
@@ -879,6 +888,9 @@ impl VrmAvatar {
             gl.color_mask(true, true, true, true);
             gl.clear_color(clear[0], clear[1], clear[2], clear[3]);
             gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT);
+            if let Some(image) = background {
+                state.draw_background(gl, image, size)?;
+            }
             gl.front_face(glow::CCW);
             gl.blend_equation(glow::FUNC_ADD);
             // Keeps the framebuffer's alpha premultiplied for egui.
@@ -965,7 +977,7 @@ impl VrmAvatar {
 
     fn create_gl(&mut self, gl: &glow::Context, size: [u32; 2]) -> Result<GlState, String> {
         unsafe {
-            let program = compile_program(gl)?;
+            let program = compile_program(gl, VERTEX_SHADER, FRAGMENT_SHADER)?;
             gl.use_program(Some(program));
             gl.uniform_1_i32(gl.get_uniform_location(program, "u_texture").as_ref(), 0);
 
@@ -999,6 +1011,10 @@ impl VrmAvatar {
                 geometries.push(GlGeometry { vao, vertex_buffer });
             }
 
+            let background_program = compile_program(gl, BACKGROUND_VERTEX_SHADER, BACKGROUND_FRAGMENT_SHADER)?;
+            gl.use_program(Some(background_program));
+            gl.uniform_1_i32(gl.get_uniform_location(background_program, "u_texture").as_ref(), 0);
+
             let mut msaa = Msaa {
                 framebuffer: gl.create_framebuffer()?,
                 color: gl.create_renderbuffer()?,
@@ -1022,6 +1038,10 @@ impl VrmAvatar {
                 white,
                 geometries,
                 msaa,
+                u_background_crop: gl.get_uniform_location(background_program, "u_crop"),
+                background_program,
+                background_vao: gl.create_vertex_array()?,
+                background: None,
             })
         }
     }
@@ -1537,10 +1557,100 @@ void main() {
 }
 "#;
 
-unsafe fn compile_program(gl: &glow::Context) -> Result<glow::Program, String> {
+/// Fills the view with the background image, cropped to cover it. Drawn as
+/// one triangle larger than the screen, with no vertex data.
+const BACKGROUND_VERTEX_SHADER: &str = r#"#version 330 core
+uniform vec4 u_crop; // part of the image shown: origin (xy) and size (zw)
+out vec2 v_uv;
+void main() {
+    vec2 corner = vec2(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0);
+    vec2 screen = corner * 0.5 + 0.5;
+    // Image rows run top to bottom; OpenGL's y runs bottom to top.
+    v_uv = u_crop.xy + vec2(screen.x, 1.0 - screen.y) * u_crop.zw;
+    gl_Position = vec4(corner, 0.0, 1.0);
+}
+"#;
+
+const BACKGROUND_FRAGMENT_SHADER: &str = r#"#version 330 core
+in vec2 v_uv;
+uniform sampler2D u_texture;
+out vec4 frag_color;
+void main() {
+    frag_color = vec4(texture(u_texture, v_uv).rgb, 1.0);
+}
+"#;
+
+impl GlState {
+    /// Draw `image` over the whole framebuffer, cropped to cover `size`.
+    /// Uploads it first if it's a different image than last time.
+    unsafe fn draw_background(
+        &mut self,
+        gl: &glow::Context,
+        image: &std::sync::Arc<image::RgbaImage>,
+        size: [u32; 2],
+    ) -> Result<(), String> {
+        let key = std::sync::Arc::as_ptr(image) as usize;
+        unsafe {
+            let dimensions = [image.width(), image.height()];
+            match self.background {
+                Some((uploaded, _, _)) if uploaded == key => {}
+                // A new frame of the same size (a video): reuse the texture.
+                Some((_, texture, uploaded_size)) if uploaded_size == dimensions => {
+                    gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+                    gl.tex_sub_image_2d(
+                        glow::TEXTURE_2D,
+                        0,
+                        0,
+                        0,
+                        dimensions[0] as i32,
+                        dimensions[1] as i32,
+                        glow::RGBA,
+                        glow::UNSIGNED_BYTE,
+                        glow::PixelUnpackData::Slice(Some(image.as_raw())),
+                    );
+                    gl.generate_mipmap(glow::TEXTURE_2D);
+                    self.background = Some((key, texture, dimensions));
+                }
+                _ => {
+                    if let Some((_, old, _)) = self.background.take() {
+                        gl.delete_texture(old);
+                    }
+                    self.background = Some((key, upload_texture(gl, dimensions, image.as_raw())?, dimensions));
+                }
+            }
+            let Some((_, texture, [image_w, image_h])) = self.background else {
+                return Ok(());
+            };
+            // Cover: show the middle of the image at the view's aspect ratio.
+            let view_aspect = size[0] as f32 / size[1].max(1) as f32;
+            let image_aspect = image_w as f32 / image_h.max(1) as f32;
+            let crop = if image_aspect > view_aspect {
+                let width = view_aspect / image_aspect;
+                [(1.0 - width) / 2.0, 0.0, width, 1.0]
+            } else {
+                let height = image_aspect / view_aspect;
+                [0.0, (1.0 - height) / 2.0, 1.0, height]
+            };
+            gl.disable(glow::DEPTH_TEST);
+            gl.disable(glow::BLEND);
+            gl.disable(glow::CULL_FACE);
+            gl.use_program(Some(self.background_program));
+            gl.uniform_4_f32_slice(self.u_background_crop.as_ref(), &crop);
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            gl.bind_vertex_array(Some(self.background_vao));
+            gl.draw_arrays(glow::TRIANGLES, 0, 3);
+            gl.bind_vertex_array(None);
+            gl.enable(glow::DEPTH_TEST);
+        }
+        Ok(())
+    }
+}
+
+unsafe fn compile_program(gl: &glow::Context, vertex: &str, fragment: &str) -> Result<glow::Program, String> {
     unsafe {
         let program = gl.create_program()?;
-        for (kind, source) in [(glow::VERTEX_SHADER, VERTEX_SHADER), (glow::FRAGMENT_SHADER, FRAGMENT_SHADER)] {
+        for (kind, source) in [(glow::VERTEX_SHADER, vertex), (glow::FRAGMENT_SHADER, fragment)] {
             let shader = gl.create_shader(kind)?;
             gl.shader_source(shader, source);
             gl.compile_shader(shader);

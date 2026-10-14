@@ -4,12 +4,11 @@
 #   scripts/build.sh          Build target/Kamen.app (same as `app`).
 #   scripts/build.sh dmg      Build the app, then target/Kamen-<version>.dmg.
 #   scripts/build.sh syphon   Rebuild the Syphon library.
-#   scripts/build.sh icon     Regenerate assets/AppIcon.* from make-icon.swift.
 #   scripts/build.sh models   Re-convert the MediaPipe models from Google's.
 #
-# `app` and `dmg` are the everyday ones. The other three only matter when
-# their inputs change: `app` builds Syphon itself the first time, and the icon
-# and models are committed.
+# `app` and `dmg` are the everyday ones. The other two only matter when
+# their inputs change: `app` builds Syphon itself the first time, and the
+# models are committed.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -50,21 +49,6 @@ build_syphon() {
         -o "$out/libSyphon.dylib"
     cp "$src/License.txt" "$out/LICENSE-Syphon.txt"
     echo "Built $out/libSyphon.dylib"
-}
-
-# assets/AppIcon.png and .icns, drawn by scripts/make-icon.swift.
-build_icon() {
-    set_dir=target/AppIcon.iconset
-    rm -rf "$set_dir"
-    mkdir -p "$set_dir" assets
-    swift scripts/make-icon.swift assets/AppIcon.png
-    for size in 16 32 128 256 512; do
-        double=$((size * 2))
-        sips -z "$size" "$size" assets/AppIcon.png --out "$set_dir/icon_${size}x${size}.png" >/dev/null
-        sips -z "$double" "$double" assets/AppIcon.png --out "$set_dir/icon_${size}x${size}@2x.png" >/dev/null
-    done
-    iconutil -c icns "$set_dir" -o assets/AppIcon.icns
-    echo "Built assets/AppIcon.icns"
 }
 
 # models/mediapipe/*.onnx, converted from Google's official MediaPipe bundle.
@@ -189,10 +173,9 @@ case "${1:-app}" in
     app) build_app ;;
     dmg) build_dmg ;;
     syphon) build_syphon ;;
-    icon) build_icon ;;
     models) build_models ;;
     *)
-        sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
         exit 1
         ;;
 esac

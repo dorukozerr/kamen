@@ -3,6 +3,7 @@ mod body;
 mod face;
 mod platform;
 mod tracker;
+mod video;
 mod vrm;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -42,7 +43,7 @@ const AVATAR_MAX_RENDER_SIDE: f32 = 1600.0;
 /// The project's source code.
 const GITHUB_URL: &str = "https://github.com/dorukozerr/kamen";
 
-const SIDEBAR_WIDTH: f32 = 272.0;
+const SIDEBAR_WIDTH: f32 = 300.0;
 const CANVAS: egui::Color32 = egui::Color32::from_rgb(24, 25, 29);
 const SURFACE: egui::Color32 = egui::Color32::from_rgb(32, 33, 38);
 const CONTROL: egui::Color32 = egui::Color32::from_rgb(46, 48, 55);
@@ -178,8 +179,11 @@ struct App {
     avatar_error: Option<String>,
     /// Sidebar hidden: the window shows only the avatar.
     avatar_only: bool,
+    /// Drawn into the avatar render itself, so OBS gets the same background
+    /// as the window.
     background: Background,
-    background_image: Option<egui::TextureHandle>,
+    background_image: Option<Arc<image::RgbaImage>>,
+    background_video: Option<video::VideoBackground>,
 
     /// Float above other windows. A fully covered window stops being drawn,
     /// which freezes it in OBS's window capture.
@@ -205,7 +209,7 @@ impl App {
             show_preview: false,
             preview_flag: Arc::new(AtomicBool::new(false)),
             tracker_rx: None,
-            body_flag: Arc::new(AtomicBool::new(true)),
+            body_flag: Arc::new(AtomicBool::new(false)),
             body_rx: None,
             body_result: None,
             body: body::BodySolver::default(),
@@ -218,6 +222,7 @@ impl App {
             avatar_only: false,
             background: Background::Color(CANVAS),
             background_image: None,
+            background_video: None,
             keep_on_top: false,
             low_fps: true,
             syphon_enabled: true,
@@ -288,21 +293,37 @@ impl App {
         }
     }
 
-    fn pick_background_image(&mut self, ctx: &egui::Context) {
+    fn pick_background(&mut self) {
+        const IMAGE_EXTENSIONS: [&str; 6] = ["png", "jpg", "jpeg", "webp", "bmp", "gif"];
+        let all: Vec<&str> = IMAGE_EXTENSIONS.iter().chain(&video::VIDEO_EXTENSIONS).copied().collect();
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("Image", &["png", "jpg", "jpeg", "webp", "bmp"])
+            .add_filter("Image or video", &all)
+            .add_filter("Image", &IMAGE_EXTENSIONS)
+            .add_filter("Video", &video::VIDEO_EXTENSIONS)
             .pick_file()
         else {
             return;
         };
+        let extension = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if video::VIDEO_EXTENSIONS.contains(&extension.as_str()) {
+            match video::VideoBackground::open(&path) {
+                Ok(video) => {
+                    self.background_video = Some(video);
+                    self.background = Background::Video;
+                    self.avatar_error = None;
+                }
+                Err(error) => self.avatar_error = Some(format!("Background video: {error}")),
+            }
+            return;
+        }
         match image::open(&path) {
             Ok(image) => {
-                let rgba = image.to_rgba8();
-                let size = [rgba.width() as usize, rgba.height() as usize];
-                let color = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
-                self.background_image =
-                    Some(ctx.load_texture("background", color, egui::TextureOptions::LINEAR));
+                self.background_image = Some(Arc::new(image.to_rgba8()));
                 self.background = Background::Image;
+                self.background_video = None;
                 self.avatar_error = None;
             }
             Err(error) => self.avatar_error = Some(format!("Background image: {error}")),
@@ -342,21 +363,10 @@ impl App {
         let rect = ui.available_rect_before_wrap();
         let response = ui.allocate_rect(rect, egui::Sense::drag());
         let painter = ui.painter_at(rect);
-        match self.background {
-            Background::Color(color) => {
-                painter.rect_filled(rect, 0.0, color);
-            }
-            Background::Image => {
-                if let Some(texture) = &self.background_image {
-                    painter.image(
-                        texture.id(),
-                        cover_rect(texture.size_vec2(), rect),
-                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
-                    );
-                }
-            }
-        }
+        // Shows through only with a transparent background; otherwise the
+        // avatar render covers it with the chosen background.
+        painter.rect_filled(rect, 0.0, CANVAS);
+        let (clear, background_image) = self.background_render();
         let Some(avatar) = self.avatar.as_mut() else {
             painter.text(
                 rect.center(),
@@ -409,7 +419,14 @@ impl App {
                 }
             },
         };
-        if let Err(error) = avatar.render(&gl, target, [0.0; 4], &self.face.state, &self.body.state) {
+        if let Err(error) = avatar.render(
+            &gl,
+            target,
+            clear,
+            background_image.as_ref(),
+            &self.face.state,
+            &self.body.state,
+        ) {
             self.avatar_error = Some(format!("Avatar render: {error}"));
             self.avatar = None;
             return;
@@ -447,6 +464,7 @@ impl App {
     /// Draw the avatar while the window is hidden. eframe paints nothing
     /// then, which would freeze the picture OBS gets.
     fn present_while_hidden(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let (clear, background_image) = self.background_render();
         let (Some(avatar), Some(target), Some(gl)) = (
             self.avatar.as_mut(),
             self.avatar_target.as_ref(),
@@ -454,29 +472,40 @@ impl App {
         ) else {
             return;
         };
-        // With Syphon on, OBS gets the avatar from Syphon (transparent
-        // background), so the window itself doesn't need drawing.
+        let rendered = avatar.render(
+            &gl,
+            target,
+            clear,
+            background_image.as_ref(),
+            &self.face.state,
+            &self.body.state,
+        );
+        if rendered.is_err() {
+            return;
+        }
         if let Some(server) = &self.syphon {
-            if avatar
-                .render(&gl, target, [0.0; 4], &self.face.state, &self.body.state)
-                .is_ok()
-            {
-                target.publish_syphon(&gl, server);
-            }
-            return;
+            target.publish_syphon(&gl, server);
         }
-        // The background image is an egui texture, which only egui can draw;
-        // it shows as black here.
-        let clear = match self.background {
-            Background::Color(color) => color.to_normalized_gamma_f32(),
-            Background::Image => [0.0, 0.0, 0.0, 1.0],
-        };
-        if avatar.render(&gl, target, clear, &self.face.state, &self.body.state).is_err() {
-            return;
+        // Window capture needs the window itself updated.
+        if self.avatar_only {
+            let window = ctx.content_rect().size() * ctx.pixels_per_point();
+            target.blit_to_window(&gl, [window.x.round() as u32, window.y.round() as u32]);
+            platform::present_gl_frame();
         }
-        let window = ctx.content_rect().size() * ctx.pixels_per_point();
-        target.blit_to_window(&gl, [window.x.round() as u32, window.y.round() as u32]);
-        platform::present_gl_frame();
+    }
+
+    /// The avatar render's clear color (premultiplied alpha) and background
+    /// image, for the chosen background.
+    fn background_render(&self) -> ([f32; 4], Option<Arc<image::RgbaImage>>) {
+        match self.background {
+            Background::Color(color) => (color.to_normalized_gamma_f32(), None),
+            Background::Image => ([0.0, 0.0, 0.0, 1.0], self.background_image.clone()),
+            Background::Video => (
+                [0.0, 0.0, 0.0, 1.0],
+                self.background_video.as_ref().and_then(|video| video.frame()),
+            ),
+            Background::Transparent => ([0.0; 4], None),
+        }
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
@@ -506,20 +535,10 @@ impl App {
             ui.colored_label(BAD, error);
         }
         if let Some(avatar) = &mut self.avatar {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Framing").color(TEXT_DIM));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    for (label, view) in [
-                        ("Full", avatar::View::FullBody),
-                        ("Bust", avatar::View::Bust),
-                        ("Face", avatar::View::Face),
-                    ] {
-                        if ui.button(label).clicked() {
-                            avatar.set_view(view);
-                        }
-                    }
-                });
-            });
+            let views = [avatar::View::Face, avatar::View::Bust, avatar::View::FullBody];
+            if let Some(index) = segmented(ui, &["Face", "Bust", "Full body"], None) {
+                avatar.set_view(views[index]);
+            }
             hint(ui, "Scroll to zoom, drag to move.");
         }
 
@@ -597,19 +616,24 @@ impl App {
             .on_hover_text("Off draws 60 frames a second, for about twice the CPU and GPU use.");
 
         section(ui, "Background");
-        let ctx = ui.ctx().clone();
-        ui.horizontal(|ui| {
-            let is_color = matches!(self.background, Background::Color(_));
-            if ui.selectable_label(is_color, "Color").clicked() && !is_color {
+        let selected = match self.background {
+            Background::Color(_) => 0,
+            Background::Image | Background::Video => 1,
+            Background::Transparent => 2,
+        };
+        match stacked(ui, &["Color", "Image or video…", "Transparent"], selected) {
+            Some(0) if selected != 0 => {
                 self.background = Background::Color(CANVAS);
+                // Stop decoding a video nobody sees.
+                self.background_video = None;
             }
-            if ui
-                .selectable_label(matches!(self.background, Background::Image), "Image…")
-                .clicked()
-            {
-                self.pick_background_image(&ctx);
+            Some(1) => self.pick_background(),
+            Some(2) => {
+                self.background = Background::Transparent;
+                self.background_video = None;
             }
-        });
+            _ => {}
+        }
         if let Background::Color(color) = &mut self.background {
             ui.horizontal(|ui| {
                 ui.color_edit_button_srgba(color);
@@ -621,9 +645,17 @@ impl App {
                 }
             });
         }
+        if selected == 1 {
+            hint(ui, "An image, or a looping MP4 / MOV video.");
+        }
         hint(
             ui,
-            "Only seen in this window. OBS gets a transparent background.",
+            match self.background {
+                Background::Transparent => {
+                    "OBS gets only the avatar. Turn on Allow Transparency in OBS's Syphon source."
+                }
+                _ => "OBS gets the same background as this window.",
+            },
         );
 
         ui.add_space(12.0);
@@ -786,11 +818,21 @@ impl eframe::App for App {
             egui::Panel::right("controls")
                 .resizable(false)
                 .exact_size(SIDEBAR_WIDTH)
-                .frame(egui::Frame::new().fill(SURFACE).inner_margin(16.0))
+                // Extra room on the right for the scroll bar.
+                .frame(egui::Frame::new().fill(SURFACE).inner_margin(egui::Margin {
+                    left: 16,
+                    right: 22,
+                    top: 16,
+                    bottom: 16,
+                }))
                 .show_inside(ui, |ui| {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
-                        .show(ui, |ui| self.sidebar(ui));
+                        .show(ui, |ui| {
+                            // Rows lay out within the panel instead of growing past it.
+                            ui.set_max_width(ui.available_width());
+                            self.sidebar(ui);
+                        });
                 });
         }
         egui::CentralPanel::default()
@@ -798,6 +840,36 @@ impl eframe::App for App {
             .show_inside(ui, |ui| self.show_avatar(ui, frame));
         ctx.request_repaint_after(self.frame_interval());
     }
+}
+
+/// A row of equal-width buttons filling the available width. `selected`
+/// highlights one; returns the index clicked, if any.
+fn segmented(ui: &mut egui::Ui, labels: &[&str], selected: Option<usize>) -> Option<usize> {
+    let mut clicked = None;
+    ui.columns(labels.len(), |columns| {
+        for (index, (column, label)) in columns.iter_mut().zip(labels).enumerate() {
+            column.with_layout(egui::Layout::top_down_justified(egui::Align::Center), |ui| {
+                if ui.selectable_label(selected == Some(index), *label).clicked() {
+                    clicked = Some(index);
+                }
+            });
+        }
+    });
+    clicked
+}
+
+/// Full-width options stacked vertically, one selected. Returns the index
+/// clicked, if any.
+fn stacked(ui: &mut egui::Ui, labels: &[&str], selected: usize) -> Option<usize> {
+    let mut clicked = None;
+    ui.with_layout(egui::Layout::top_down_justified(egui::Align::Min), |ui| {
+        for (index, label) in labels.iter().enumerate() {
+            if ui.selectable_label(selected == index, *label).clicked() {
+                clicked = Some(index);
+            }
+        }
+    });
+    clicked
 }
 
 /// Small dim heading that starts a group of controls.
@@ -959,12 +1031,10 @@ fn default_avatar_path() -> Option<std::path::PathBuf> {
 enum Background {
     Color(egui::Color32),
     Image,
-}
-
-/// Rect that covers `area` with an image of `size`, keeping its aspect ratio.
-fn cover_rect(size: egui::Vec2, area: egui::Rect) -> egui::Rect {
-    let scale = (area.width() / size.x).max(area.height() / size.y);
-    egui::Rect::from_center_size(area.center(), size * scale)
+    /// A looping video (`background_video`).
+    Video,
+    /// Nothing behind the avatar: OBS can composite it over the scene.
+    Transparent,
 }
 
 #[derive(Default)]
