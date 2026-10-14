@@ -19,6 +19,16 @@ const MAX_PITCH: f32 = 0.50;
 const MAX_ROLL: f32 = 0.50;
 /// How the head rotation is spread along the spine, hips to head.
 const BONE_SHARES: [(&str, f32); 4] = [("spine", 0.1), ("chest", 0.1), ("neck", 0.3), ("head", 0.5)];
+/// Chest rotation in radians at the peak of a breath.
+const BREATH_ANGLE: f32 = 0.012;
+/// How strongly a tracked smile / raised brows drive the `happy` and
+/// `surprised` expressions. Kept below 1: on VRoid models the full
+/// expressions also close or widen the eyes.
+const SMILE_WEIGHT: f32 = 0.7;
+const BROW_WEIGHT: f32 = 0.6;
+/// Outline thickness limit in meters. Models thin their outlines with a
+/// width texture we don't read, so the declared width is an upper bound.
+const OUTLINE_MAX: f32 = 0.0015;
 /// VRM rests in a T-pose; lower the arms by this angle.
 const ARM_DOWN: f32 = 1.25;
 /// Sideways hip travel in meters at body_x = 1.
@@ -97,6 +107,9 @@ struct Material {
     image: Option<usize>,
     color: [f32; 4],
     shade: [f32; 3],
+    /// Outline thickness in meters (0 = none) and its color multiplier.
+    outline_width: f32,
+    outline_color: [f32; 3],
     /// N·L where shading is fully dark / fully lit.
     shade_range: [f32; 2],
     alpha: AlphaMode,
@@ -164,6 +177,8 @@ struct GlState {
     u_light: Option<glow::UniformLocation>,
     u_cutoff: Option<glow::UniformLocation>,
     u_alpha_mode: Option<glow::UniformLocation>,
+    u_outline_width: Option<glow::UniformLocation>,
+    u_outline_color: Option<glow::UniformLocation>,
     textures: HashMap<usize, glow::Texture>,
     white: glow::Texture,
     geometries: Vec<GlGeometry>,
@@ -598,7 +613,14 @@ impl VrmAvatar {
         );
         for (bone, share) in BONE_SHARES {
             if self.bones.contains_key(bone) {
-                self.rotate_bone(bone, Quat::from_euler(EulerRot::YXZ, yaw * share, pitch * share, roll * share));
+                // Breathing tips the chest; the neck cancels it so the head stays level.
+                let breath = match bone {
+                    "chest" => -face.breath * BREATH_ANGLE,
+                    "neck" => face.breath * BREATH_ANGLE,
+                    _ => 0.0,
+                };
+                let bone_pitch = pitch * share + breath;
+                self.rotate_bone(bone, Quat::from_euler(EulerRot::YXZ, yaw * share, bone_pitch, roll * share));
                 values.push((format!("Bone: {bone}"), Vec2::new(yaw * share, pitch * share).map(f32::to_degrees)));
             }
         }
@@ -624,13 +646,18 @@ impl VrmAvatar {
         }
         let wide = face.mouth_width.clamp(0.0, 1.0) * (1.0 - face.mouth_open) * 0.6;
         let narrow = (-face.mouth_width).clamp(0.0, 1.0) * (1.0 - face.mouth_open) * 0.6;
+        let happy = face.smile * SMILE_WEIGHT;
+        // `happy` already narrows the eyes; a full blink on top over-closes them.
+        let blink_scale = 1.0 - happy * 0.6;
         for expression in &self.expressions {
             let value = match expression.name.as_str() {
-                "blinkLeft" => face.blink_left,
-                "blinkRight" => face.blink_right,
+                "blinkLeft" => face.blink_left * blink_scale,
+                "blinkRight" => face.blink_right * blink_scale,
                 "aa" => face.mouth_open,
                 "ih" => wide,
                 "ou" => narrow,
+                "happy" => happy,
+                "surprised" => face.brow_raise * BROW_WEIGHT,
                 _ => continue,
             }
             .clamp(0.0, 1.0);
@@ -745,12 +772,26 @@ impl VrmAvatar {
                 gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, 0, as_bytes(&geometry.vertices));
             }
             let default_material = Material::default();
+            // Solid surfaces, then their outlines, then transparent surfaces.
+            // An outline is the same mesh pushed out along its normals and
+            // drawn inside-out, so only a rim shows around the solid pass.
+            let passes = [(false, false), (true, false), (false, true)];
+            for (outline, transparent) in passes {
             for &(g, p) in &self.draw_order {
                 let primitive = &self.geometries[g].primitives[p];
                 let material = primitive
                     .material
                     .and_then(|m| self.materials.get(m))
                     .unwrap_or(&default_material);
+                if (material.alpha == AlphaMode::Blend) != transparent {
+                    continue;
+                }
+                if outline && material.outline_width <= 0.0 {
+                    continue;
+                }
+                let outline_width = if outline { material.outline_width.min(OUTLINE_MAX) } else { 0.0 };
+                gl.uniform_1_f32(state.u_outline_width.as_ref(), outline_width);
+                gl.uniform_3_f32_slice(state.u_outline_color.as_ref(), &material.outline_color);
                 let texture = material.image.and_then(|image| state.textures.get(&image)).unwrap_or(&state.white);
                 gl.bind_texture(glow::TEXTURE_2D, Some(*texture));
                 gl.uniform_4_f32_slice(state.u_color.as_ref(), &material.color);
@@ -764,10 +805,14 @@ impl VrmAvatar {
                     gl.disable(glow::BLEND);
                 }
                 gl.depth_mask(material.depth_write);
-                if material.double_sided {
+                if outline {
+                    gl.enable(glow::CULL_FACE);
+                    gl.cull_face(glow::FRONT);
+                } else if material.double_sided {
                     gl.disable(glow::CULL_FACE);
                 } else {
                     gl.enable(glow::CULL_FACE);
+                    gl.cull_face(glow::BACK);
                 }
                 gl.bind_vertex_array(Some(state.geometries[g].vao));
                 gl.draw_elements(
@@ -777,6 +822,8 @@ impl VrmAvatar {
                     (primitive.index_offset * 4) as i32,
                 );
             }
+            }
+            gl.cull_face(glow::BACK);
 
             gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(state.msaa.framebuffer));
             gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(target));
@@ -847,6 +894,8 @@ impl VrmAvatar {
                 u_light: gl.get_uniform_location(program, "u_light"),
                 u_cutoff: gl.get_uniform_location(program, "u_cutoff"),
                 u_alpha_mode: gl.get_uniform_location(program, "u_alpha_mode"),
+                u_outline_width: gl.get_uniform_location(program, "u_outline_width"),
+                u_outline_color: gl.get_uniform_location(program, "u_outline_color"),
                 textures,
                 white,
                 geometries,
@@ -862,6 +911,8 @@ impl Default for Material {
             image: None,
             color: [1.0; 4],
             shade: [0.8; 3],
+            outline_width: 0.0,
+            outline_color: [0.0; 3],
             shade_range: [-0.1, 0.1],
             alpha: AlphaMode::Opaque,
             cutoff: 0.5,
@@ -959,6 +1010,17 @@ fn read_material(material: &gltf::Material, index: usize, json: &Value, is_vrm0:
         if alpha == AlphaMode::Blend {
             out.depth_write = float["_ZWrite"].as_f64().is_some_and(|z| z > 0.5);
         }
+        // Width mode 1 is world space, in centimeters; 2 is screen space,
+        // approximated with a fixed thin line.
+        let width = float["_OutlineWidth"].as_f64().unwrap_or(0.0) as f32;
+        out.outline_width = match float["_OutlineWidthMode"].as_f64().unwrap_or(0.0) as i32 {
+            1 => width * 0.01,
+            2 => 0.001,
+            _ => 0.0,
+        };
+        if let Some(color) = floats::<3>(&vector["_OutlineColor"]) {
+            out.outline_color = color;
+        }
     } else {
         let mtoon = &json["materials"][index]["extensions"]["VRMC_materials_mtoon"];
         if let Some(shade) = floats::<3>(&mtoon["shadeColorFactor"]) {
@@ -972,6 +1034,14 @@ fn read_material(material: &gltf::Material, index: usize, json: &Value, is_vrm0:
         out.queue += mtoon["renderQueueOffsetNumber"].as_i64().unwrap_or(0) as i32;
         if alpha == AlphaMode::Blend {
             out.depth_write = mtoon["transparentWithZWrite"].as_bool().unwrap_or(false);
+        }
+        out.outline_width = match mtoon["outlineWidthMode"].as_str() {
+            Some("worldCoordinates") => mtoon["outlineWidthFactor"].as_f64().unwrap_or(0.0) as f32,
+            Some("screenCoordinates") => 0.001,
+            _ => 0.0,
+        };
+        if let Some(color) = floats::<3>(&mtoon["outlineColorFactor"]) {
+            out.outline_color = color.map(linear_to_srgb);
         }
     }
     out
@@ -1288,12 +1358,17 @@ layout(location = 0) in vec3 a_position;
 layout(location = 1) in vec3 a_normal;
 layout(location = 2) in vec2 a_uv;
 uniform mat4 u_view_proj;
+uniform float u_outline_width; // > 0 in the outline pass: push the surface out
 out vec3 v_normal;
 out vec2 v_uv;
 void main() {
     v_normal = a_normal;
     v_uv = a_uv;
-    gl_Position = u_view_proj * vec4(a_position, 1.0);
+    vec3 position = a_position;
+    if (u_outline_width > 0.0 && dot(a_normal, a_normal) > 0.0) {
+        position += normalize(a_normal) * u_outline_width;
+    }
+    gl_Position = u_view_proj * vec4(position, 1.0);
 }
 "#;
 
@@ -1309,6 +1384,8 @@ uniform vec2 u_shade_range;
 uniform vec3 u_light;
 uniform float u_cutoff;
 uniform int u_alpha_mode; // 0 opaque, 1 mask, 2 blend
+uniform float u_outline_width;
+uniform vec3 u_outline_color;
 out vec4 frag_color;
 void main() {
     vec4 base = texture(u_texture, v_uv) * u_color;
@@ -1318,6 +1395,10 @@ void main() {
     } else if (u_alpha_mode == 2) {
         alpha = base.a;
         if (alpha < 0.004) discard;
+    }
+    if (u_outline_width > 0.0) {
+        frag_color = vec4(base.rgb * u_outline_color, 1.0);
+        return;
     }
     vec3 normal = normalize(v_normal);
     if (!gl_FrontFacing) normal = -normal;

@@ -1,5 +1,6 @@
 mod avatar;
 mod face;
+mod platform;
 mod tracker;
 mod vrm;
 
@@ -50,7 +51,7 @@ impl AutofocusState {
 
 const SHARPEST_BURST_SIZE: usize = 16;
 const SHARPEST_BURST_INTERVAL: Duration = Duration::from_millis(30);
-const AUTOFOCUS_SETTLE: Duration = Duration::from_millis(150);
+const AUTOFOCUS_SETTLE: Duration = Duration::from_millis(100);
 const AUTOFOCUS_SWEEP_STRIDE_MULTIPLIER: f32 = 4.0;
 const AUTOFOCUS_CONTINUOUS_SAMPLES: f32 = 20.0;
 
@@ -70,15 +71,27 @@ fn main() -> Result<(), eframe::Error> {
             .with_transparent(true),
         // The avatar renderer draws with OpenGL.
         renderer: eframe::Renderer::Glow,
+        // Don't wait for the display when swapping buffers. A window that is
+        // off screen (covered, or on another Space) gets no refresh signal, so
+        // a waiting swap blocks the whole app until the window is shown
+        // again. Frames are paced with `FRAME_INTERVAL` instead.
+        vsync: false,
         ..Default::default()
     };
     eframe::run_native(
         "Kamen",
         options,
         Box::new(|_cc| {
+            platform::disable_app_nap();
             let mut app = App::new();
-            if let Some(path) = std::env::args_os().nth(1) {
-                app.load_avatar(std::path::Path::new(&path));
+            // An avatar given on the command line wins over the default one.
+            match std::env::args_os().nth(1) {
+                Some(path) => app.load_avatar(std::path::Path::new(&path)),
+                None => {
+                    if let Some(path) = default_avatar_path() {
+                        app.load_avatar(&path);
+                    }
+                }
             }
             Ok(Box::new(app))
         }),
@@ -112,6 +125,9 @@ struct App {
     autofocus: Option<AutofocusState>,
     track_enabled: bool,
     track_flag: Arc<AtomicBool>,
+    /// Whether the camera preview is on screen; the camera thread skips
+    /// converting frames for it otherwise.
+    preview_flag: Arc<AtomicBool>,
     tracker_rx: Option<mpsc::Receiver<tracker::TrackResult>>,
     track_result: Option<tracker::TrackResult>,
     camera_fps: FpsCounter,
@@ -124,6 +140,11 @@ struct App {
     /// Float above other windows. A fully covered window stops being drawn,
     /// which freezes it in OBS's window capture.
     keep_on_top: bool,
+    /// Draw at 30 fps instead of 60, for less CPU and GPU use.
+    low_fps: bool,
+    hidden_log: HiddenLog,
+    /// The window was hidden on the last frame (for logging the change).
+    presenting_hidden: bool,
     background: Background,
     background_image: Option<egui::TextureHandle>,
     #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -160,6 +181,7 @@ impl App {
             autofocus: None,
             track_enabled: true,
             track_flag: Arc::new(AtomicBool::new(true)),
+            preview_flag: Arc::new(AtomicBool::new(true)),
             tracker_rx: None,
             track_result: None,
             camera_fps: FpsCounter::default(),
@@ -170,6 +192,9 @@ impl App {
             avatar_error: None,
             avatar_only: false,
             keep_on_top: false,
+            low_fps: false,
+            hidden_log: HiddenLog::default(),
+            presenting_hidden: false,
             background: Background::Color(egui::Color32::from_rgb(0, 255, 0)),
             background_image: None,
             #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -419,6 +444,7 @@ impl App {
                         "Autofocus locked at {winner:.2} (variance {score:.1})"
                     ));
                     self.autofocus = None;
+                    ctx.request_repaint();
                 }
                 None => {
                     self.last_capture = Some("Autofocus: no samples captured".into());
@@ -469,6 +495,14 @@ impl App {
                 self.avatar_error = None;
             }
             Err(error) => self.avatar_error = Some(error),
+        }
+    }
+
+    fn frame_interval(&self) -> Duration {
+        if self.low_fps {
+            LOW_FPS_FRAME_INTERVAL
+        } else {
+            FRAME_INTERVAL
         }
     }
 
@@ -559,22 +593,27 @@ impl App {
         };
 
         let pixels_per_point = ui.ctx().pixels_per_point();
+        let view = rect.size() * pixels_per_point;
+        // Render at screen resolution up to a limit; a larger view is scaled
+        // up. Every pixel is shaded four times for anti-aliasing.
+        let render_scale = (AVATAR_MAX_RENDER_SIDE / view.max_elem()).min(1.0);
         let size = [
-            (rect.width() * pixels_per_point).round() as u32,
-            (rect.height() * pixels_per_point).round() as u32,
+            (view.x * render_scale).round() as u32,
+            (view.y * render_scale).round() as u32,
         ];
+        let view_height = view.y.round() as u32;
         // Scroll (or pinch) to zoom toward the cursor, drag to move.
         if let Some(pointer) = response.hover_pos() {
             let (scroll, pinch) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
             let factor = (scroll * 0.002).exp() * pinch;
             if factor != 1.0 {
                 let anchor = (pointer - rect.center()) * pixels_per_point;
-                avatar.zoom_at(factor, glam::Vec2::new(anchor.x, anchor.y), size[1]);
+                avatar.zoom_at(factor, glam::Vec2::new(anchor.x, anchor.y), view_height);
             }
         }
         if response.dragged() {
             let delta = response.drag_delta() * pixels_per_point;
-            avatar.pan(glam::Vec2::new(delta.x, delta.y), size[1]);
+            avatar.pan(glam::Vec2::new(delta.x, delta.y), view_height);
         }
 
         let target = match self.avatar_target.as_mut() {
@@ -608,9 +647,11 @@ impl App {
     /// eframe paints nothing while the window is hidden, which would freeze
     /// the picture OBS captures from it.
     fn present_while_hidden(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        let (Some(avatar), Some(target), Some(gl)) =
-            (self.avatar.as_mut(), self.avatar_target.as_ref(), frame.gl().cloned())
-        else {
+        let (Some(avatar), Some(target), Some(gl)) = (
+            self.avatar.as_mut(),
+            self.avatar_target.as_ref(),
+            frame.gl().cloned(),
+        ) else {
             return;
         };
         // The background image is an egui texture, which only egui can draw;
@@ -625,7 +666,9 @@ impl App {
         }
         let window = ctx.content_rect().size() * ctx.pixels_per_point();
         target.blit_to_window(&gl, [window.x.round() as u32, window.y.round() as u32]);
-        present_gl_frame();
+        self.hidden_log.before_present();
+        let presented = platform::present_gl_frame();
+        self.hidden_log.frame(presented);
     }
 
     fn avatar_panel(&mut self, ui: &mut egui::Ui) {
@@ -662,6 +705,8 @@ impl App {
         {
             self.apply_window_level(ui.ctx());
         }
+        ui.checkbox(&mut self.low_fps, "30 fps (lighter)")
+            .on_hover_text("Draws 30 frames a second instead of 60. Roughly halves CPU and GPU use.");
         if ui.button("Avatar only (Esc to exit)").clicked() {
             self.avatar_only = true;
         }
@@ -681,7 +726,10 @@ impl App {
                 self.pick_background_image(&ctx);
             }
             if ui
-                .selectable_label(matches!(self.background, Background::Transparent), "Transparent")
+                .selectable_label(
+                    matches!(self.background, Background::Transparent),
+                    "Transparent",
+                )
                 .clicked()
             {
                 self.background = Background::Transparent;
@@ -698,7 +746,11 @@ impl App {
 
         if let Some(avatar) = &mut self.avatar {
             ui.separator();
-            ui.add(egui::Slider::new(&mut avatar.zoom, 0.1..=20.0).logarithmic(true).text("Zoom"));
+            ui.add(
+                egui::Slider::new(&mut avatar.zoom, 0.1..=20.0)
+                    .logarithmic(true)
+                    .text("Zoom"),
+            );
             ui.horizontal(|ui| {
                 if ui.small_button("Face").clicked() {
                     avatar.set_view(avatar::View::Face);
@@ -712,16 +764,20 @@ impl App {
             });
             ui.weak("Scroll or pinch to zoom toward the cursor, drag to move.");
             ui.collapsing(format!("Parameters ({})", avatar.params.len()), |ui| {
-                egui::Grid::new("avatar_params").striped(true).show(ui, |ui| {
-                    for param in &avatar.params {
-                        ui.label(param);
-                        match avatar.values.iter().find(|(name, _)| name == param) {
-                            Some((_, value)) => ui.monospace(format!("{:+.2} {:+.2}", value.x, value.y)),
-                            None => ui.weak("not tracked"),
-                        };
-                        ui.end_row();
-                    }
-                });
+                egui::Grid::new("avatar_params")
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for param in &avatar.params {
+                            ui.label(param);
+                            match avatar.values.iter().find(|(name, _)| name == param) {
+                                Some((_, value)) => {
+                                    ui.monospace(format!("{:+.2} {:+.2}", value.x, value.y))
+                                }
+                                None => ui.weak("not tracked"),
+                            };
+                            ui.end_row();
+                        }
+                    });
             });
         }
     }
@@ -751,7 +807,12 @@ impl App {
         match cameras::open_source(source.clone(), STREAM_CONFIG) {
             Ok(camera) => {
                 let (tracker_tx, tracker_rx) = tracker::spawn_tracker();
-                self.stream = Some(spawn_stream(camera, tracker_tx, self.track_flag.clone()));
+                self.stream = Some(spawn_stream(
+                    camera,
+                    tracker_tx,
+                    self.track_flag.clone(),
+                    self.preview_flag.clone(),
+                ));
                 self.active = true;
                 self.tracker_rx = Some(tracker_rx);
                 self.track_result = None;
@@ -882,12 +943,27 @@ impl eframe::App for App {
         if !self.track_enabled {
             self.track_result = None;
         }
+        self.face.advance();
 
         let hidden = ctx.input(|i| i.viewport().occluded == Some(true));
+        self.preview_flag
+            .store(!self.avatar_only && !hidden, Ordering::Relaxed);
         if hidden && self.avatar_only {
+            if !self.presenting_hidden {
+                self.presenting_hidden = true;
+                self.hidden_log
+                    .note("hidden in Avatar only mode: drawing the avatar directly");
+            }
             self.present_while_hidden(ctx, frame);
             // `ui` isn't running to ask for the next frame.
-            ctx.request_repaint_after(HIDDEN_FRAME_INTERVAL);
+            ctx.request_repaint_after(self.frame_interval());
+        } else if hidden != self.presenting_hidden {
+            self.presenting_hidden = hidden;
+            self.hidden_log.note(if hidden {
+                "hidden, but not in Avatar only mode: nothing is drawn"
+            } else {
+                "visible again"
+            });
         }
     }
 
@@ -908,7 +984,7 @@ impl eframe::App for App {
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
                 .show_inside(ui, |ui| self.show_avatar(ui, frame));
-            ctx.request_repaint();
+            ctx.request_repaint_after(self.frame_interval());
             return;
         }
 
@@ -1100,14 +1176,18 @@ impl eframe::App for App {
             });
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
-            let (left, right) = ui.available_rect_before_wrap().split_left_right_at_fraction(0.5);
-            ui.scope_builder(egui::UiBuilder::new().max_rect(left), |ui| self.show_camera(ui));
+            let (left, right) = ui
+                .available_rect_before_wrap()
+                .split_left_right_at_fraction(0.5);
+            ui.scope_builder(egui::UiBuilder::new().max_rect(left), |ui| {
+                self.show_camera(ui)
+            });
             ui.scope_builder(egui::UiBuilder::new().max_rect(right), |ui| {
                 self.show_avatar(ui, frame)
             });
         });
 
-        ctx.request_repaint();
+        ctx.request_repaint_after(self.frame_interval());
     }
 }
 
@@ -1123,6 +1203,7 @@ fn spawn_stream(
     camera: Camera,
     tracker_tx: mpsc::Sender<cameras::Frame>,
     track: Arc<AtomicBool>,
+    preview: Arc<AtomicBool>,
 ) -> CameraStream {
     let latest = Arc::new(Mutex::new(None));
     let slot = latest.clone();
@@ -1130,7 +1211,9 @@ fn spawn_stream(
         if track.load(Ordering::Relaxed) {
             let _ = tracker_tx.send(frame.clone());
         }
-        if let Some(image) = frame_to_color_image(&frame) {
+        if preview.load(Ordering::Relaxed)
+            && let Some(image) = frame_to_color_image(&frame)
+        {
             *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(image);
         }
     });
@@ -1155,16 +1238,22 @@ fn frame_to_color_image(frame: &cameras::Frame) -> Option<egui::ColorImage> {
     if data.len() < stride * height.saturating_sub(1) + width * 4 {
         return None;
     }
-    let mut pixels = Vec::with_capacity(width * height);
-    for row in 0..height {
-        let start = row * stride;
+    // The preview is shown at about half the window width, so a full-HD frame
+    // is halved: a quarter of the pixels to convert and upload.
+    let step = if width > PREVIEW_MAX_WIDTH { 2 } else { 1 };
+    let (out_width, out_height) = (width / step, height / step);
+    let mut pixels = Vec::with_capacity(out_width * out_height);
+    for row in 0..out_height {
+        let start = row * step * stride;
         pixels.extend(
             data[start..start + width * 4]
                 .chunks_exact(4)
+                .step_by(step)
+                .take(out_width)
                 .map(|px| egui::Color32::from_rgb(px[2], px[1], px[0])),
         );
     }
-    Some(egui::ColorImage::new([width, height], pixels))
+    Some(egui::ColorImage::new([out_width, out_height], pixels))
 }
 
 /// Upload the newest converted frame, if any. Returns whether one was uploaded.
@@ -1197,43 +1286,78 @@ fn show_stream(stream: &CameraStream, ui: &mut egui::Ui) -> Option<egui::Rect> {
     Some(ui.image((texture.id(), size)).rect)
 }
 
-/// Frame pacing while the window is hidden; nothing syncs to the display then.
-const HIDDEN_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+/// Avatar loaded at startup, relative to the project folder or to
+/// `Contents/Resources` in the macOS app bundle.
+const DEFAULT_AVATAR: &str = "models/vrm/doruk.vrm";
 
-/// Swap the window's buffers for the current OpenGL context. eframe owns the
-/// swap but skips it for hidden windows, and doesn't expose the surface, so
-/// this asks AppKit directly.
-#[cfg(target_os = "macos")]
-fn present_gl_frame() {
-    use std::ffi::{c_char, c_void};
-    #[link(name = "objc")]
-    unsafe extern "C" {
-        fn objc_getClass(name: *const c_char) -> *mut c_void;
-        fn sel_registerName(name: *const c_char) -> *mut c_void;
-        fn objc_msgSend();
-    }
-    // SAFETY: `+[NSOpenGLContext currentContext]` takes no arguments and
-    // returns an object or nil; `-flushBuffer` takes none and returns
-    // nothing. `objc_msgSend` must be called through the exact signature of
-    // the method, hence the two casts.
-    unsafe {
-        let send_id: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
-            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-        let send_void: unsafe extern "C" fn(*mut c_void, *mut c_void) =
-            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-        let class = objc_getClass(c"NSOpenGLContext".as_ptr());
-        if class.is_null() {
-            return;
-        }
-        let context = send_id(class, sel_registerName(c"currentContext".as_ptr()));
-        if !context.is_null() {
-            send_void(context, sel_registerName(c"flushBuffer".as_ptr()));
-        }
-    }
+/// The default avatar's location, if the file exists: inside the app bundle
+/// first (an app opened from Finder runs with `/` as working directory), then
+/// relative to the working directory.
+fn default_avatar_path() -> Option<std::path::PathBuf> {
+    let bundled = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.parent()?.join("Resources").join(DEFAULT_AVATAR)));
+    bundled
+        .into_iter()
+        .chain([std::path::PathBuf::from(DEFAULT_AVATAR)])
+        .find(|path| path.exists())
 }
 
-#[cfg(not(target_os = "macos"))]
-fn present_gl_frame() {}
+/// Time between drawn frames. Buffer swaps don't wait for the display
+/// (`vsync: false`), so this is what paces the app.
+const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+const LOW_FPS_FRAME_INTERVAL: Duration = Duration::from_millis(33);
+/// Camera frames wider than this are halved for the preview.
+const PREVIEW_MAX_WIDTH: usize = 1280;
+/// Longest side of the avatar render, in pixels.
+const AVATAR_MAX_RENDER_SIDE: f32 = 1600.0;
+
+/// Diagnostic for the hidden-window path: once a second while the window is
+/// hidden, appends how many frames were drawn to `kamen-hidden.log` in the
+/// temp directory. An app opened from Finder has no terminal to print to.
+#[derive(Default)]
+struct HiddenLog {
+    window_start: Option<Instant>,
+    frames: u32,
+    presented: u32,
+}
+
+impl HiddenLog {
+    fn note(&self, text: &str) {
+        use std::io::Write;
+        let path = std::env::temp_dir().join("kamen-hidden.log");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(file, "{} {text}", unix_timestamp());
+        }
+    }
+
+    /// Call right before presenting. Once a second this leaves a marker, so a
+    /// present call that never returns shows up as a marker with no summary.
+    fn before_present(&mut self) {
+        if self.window_start.is_none() {
+            self.window_start = Some(Instant::now());
+            self.note("presenting...");
+        }
+    }
+
+    fn frame(&mut self, presented: bool) {
+        let start = *self.window_start.get_or_insert_with(Instant::now);
+        self.frames += 1;
+        self.presented += presented as u32;
+        if start.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.note(&format!(
+            "hidden frames drawn={} presented={}",
+            self.frames, self.presented
+        ));
+        *self = Self::default();
+    }
+}
 
 #[derive(Clone, Copy)]
 enum Background {

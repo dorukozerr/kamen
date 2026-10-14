@@ -15,7 +15,15 @@ const MODEL_DIR: &str = "models/face_landmark";
 fn model_path(file: &str) -> std::path::PathBuf {
     let bundled = std::env::current_exe()
         .ok()
-        .and_then(|exe| Some(exe.parent()?.parent()?.join("Resources").join(MODEL_DIR).join(file)))
+        .and_then(|exe| {
+            Some(
+                exe.parent()?
+                    .parent()?
+                    .join("Resources")
+                    .join(MODEL_DIR)
+                    .join(file),
+            )
+        })
         .filter(|path| path.exists());
     bundled.unwrap_or_else(|| std::path::Path::new(MODEL_DIR).join(file))
 }
@@ -39,12 +47,20 @@ const STATE_OUT: &str = "Identity";
 
 /// How often the detector re-checks the head box while a face is being tracked.
 /// Between detections the box follows the landmarks.
-const DETECT_INTERVAL: Duration = Duration::from_millis(200);
+const DETECT_INTERVAL: Duration = Duration::from_millis(400);
 const HEAD_EXPAND: f32 = 0.25;
 /// If the landmark-following box moves further than this fraction of its size
 /// from the last detection, the crop has likely slipped off the face: drop it
 /// and wait for a fresh detection instead of tracking noise.
 const MAX_DRIFT: f32 = 0.5;
+/// A fresh detection of the same head only nudges the tracked box by this
+/// fraction; replacing it outright makes the crop, and so every landmark, jump.
+const DETECT_BLEND: f32 = 0.25;
+/// Detections overlapping the tracked box at least this much are the same head.
+const SAME_HEAD_IOU: f32 = 0.4;
+/// The box ignores landmark-centroid movement below this fraction of its
+/// size, so the crop holds still while the head does.
+const FOLLOW_DEAD_ZONE: f32 = 0.015;
 
 pub struct HeadTrack {
     pub rect: [f32; 4],
@@ -128,11 +144,20 @@ fn tracker_loop(rx: mpsc::Receiver<cameras::Frame>, tx: mpsc::Sender<TrackResult
 
         while let Ok(detected) = det_rx.try_recv() {
             detector_busy = false;
-            head = detected.map(|rect| Head {
-                rect,
-                detected: rect,
-                centroid_offset: None,
-            });
+            head = match (head.take(), detected) {
+                (Some(mut tracked), Some(rect)) if iou(&tracked.rect, &rect) >= SAME_HEAD_IOU => {
+                    for (edge, detected_edge) in tracked.rect.iter_mut().zip(rect) {
+                        *edge += (detected_edge - *edge) * DETECT_BLEND;
+                    }
+                    tracked.detected = rect;
+                    Some(tracked)
+                }
+                (_, detected) => detected.map(|rect| Head {
+                    rect,
+                    detected: rect,
+                    centroid_offset: None,
+                }),
+            };
         }
         let detect_due =
             head.is_none() || last_detect.is_none_or(|t| t.elapsed() >= DETECT_INTERVAL);
@@ -161,7 +186,9 @@ fn tracker_loop(rx: mpsc::Receiver<cameras::Frame>, tx: mpsc::Sender<TrackResult
 
 /// Runs the head detector on its own thread, since it is far slower than the
 /// landmark model. Replies with the best head box in frame coordinates.
-fn spawn_detector(mut detector: Session) -> (
+fn spawn_detector(
+    mut detector: Session,
+) -> (
     mpsc::Sender<cameras::Frame>,
     mpsc::Receiver<Option<[f32; 4]>>,
 ) {
@@ -203,7 +230,9 @@ fn load_detector(environment: &Environment) -> Option<Session> {
             eprintln!("face tracker: CoreML unavailable for detector ({error}), using CPU");
             Session::builder(environment)
                 .and_then(|mut b| b.commit_from_file(&path))
-                .inspect_err(|error| eprintln!("face tracker: loading {DETECTOR_PATH} failed: {error}"))
+                .inspect_err(|error| {
+                    eprintln!("face tracker: loading {DETECTOR_PATH} failed: {error}")
+                })
                 .ok()
         }
     }
@@ -313,10 +342,20 @@ fn track_landmarks(
     let offset = *head
         .centroid_offset
         .get_or_insert([centroid[0] - center[0], centroid[1] - center[1]]);
-    let shift = [
+    let mut shift = [
         centroid[0] - offset[0] - center[0],
         centroid[1] - offset[1] - center[1],
     ];
+    // Only follow movement beyond the dead zone, and only by the excess.
+    let distance = shift[0].hypot(shift[1]);
+    let dead_zone =
+        (head.rect[2] - head.rect[0]).max(head.rect[3] - head.rect[1]) * FOLLOW_DEAD_ZONE;
+    let follow = if distance > dead_zone {
+        (distance - dead_zone) / distance
+    } else {
+        0.0
+    };
+    shift = [shift[0] * follow, shift[1] * follow];
     let rect = head.rect;
     head.rect = [
         rect[0] + shift[0],
@@ -409,8 +448,11 @@ impl<'a> Pixels<'a> {
         let [dx, dy, dw, dh] = dst;
         let step_x = (src[2] - src[0]) / dw as f32;
         let step_y = (src[3] - src[1]) / dh as f32;
-        let taps_x = step_x.ceil().clamp(1.0, 4.0) as usize;
-        let taps_y = step_y.ceil().clamp(1.0, 4.0) as usize;
+        // Each tap is a bilinear sample covering 2x2 source pixels, so two
+        // taps per axis average a 4x4 block: enough for the 3-4x downscales
+        // used here, at a quarter of the cost of one tap per source pixel.
+        let taps_x = (step_x / 2.0).ceil().clamp(1.0, 2.0) as usize;
+        let taps_y = (step_y / 2.0).ceil().clamp(1.0, 2.0) as usize;
         let weight = value_scale / (taps_x * taps_y) as f32;
         let plane = out_w * out_h;
         for oy in 0..dh {
